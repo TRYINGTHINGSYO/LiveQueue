@@ -106,7 +106,7 @@ ${C.cyan}${C.bold}╔═══════════════════�
   Cookie: ${SESSION_ID ? `${C.green}✓ set${C.reset}` : `${C.yellow}⚠ not set (may fail if stream is private)${C.reset}`}
   Sync  : ${C.green}Admin panel config sync ENABLED${C.reset}
 
-  ${C.dim}Commands: !q <name>  •  !q  •  !p  •  !c  •  !help${C.reset}
+  ${C.dim}Commands: !q <name>  •  !q  •  !p  •  !c  •  !r  •  !help${C.reset}
 `);
 }
 
@@ -240,6 +240,52 @@ async function addToQueue(name) {
     }
   }
   err('No working admin add endpoint found.');
+  return 'error';
+}
+
+function findQueuedPlayerByName(name) {
+  const n = String(name || '').toLowerCase();
+  if (!n) return null;
+  return liveQueue.find(p => String(p.name || '').toLowerCase() === n) || null;
+}
+
+async function removeFromQueue(name) {
+  const clean = String(name || '').trim();
+  if (!clean) return 'not_found';
+  if (!ADMIN_PASSWORD) { err('ADMIN_PASSWORD not set — cannot remove from queue'); return 'error'; }
+
+  await refreshLiveQueueFromServer();
+  const queuedPlayer = findQueuedPlayerByName(clean);
+  if (!queuedPlayer) return 'not_found';
+
+  const attempts = [];
+  if (queuedPlayer.id) {
+    attempts.push({ url: `${BASE_URL}/api/admin/kick`, body: { id: queuedPlayer.id } });
+    attempts.push({ url: `${BASE_URL}/api/admin/remove`, body: { id: queuedPlayer.id } });
+  }
+  attempts.push({ url: `${BASE_URL}/api/admin/kick`, body: { name: clean } });
+  attempts.push({ url: `${BASE_URL}/api/admin/remove`, body: { name: clean } });
+  attempts.push({ url: `${BASE_URL}/api/admin/remove-from-queue`, body: { name: clean } });
+
+  for (const attempt of attempts) {
+    try {
+      const r = await fetchWithTimeout(attempt.url, {
+        method: 'POST', headers: authHeaders(), body: JSON.stringify(attempt.body),
+      }, 8_000);
+      const text = await r.text();
+      if (r.ok) {
+        await refreshLiveQueueFromServer();
+        return 'removed';
+      }
+      if (r.status === 404) continue;
+      err(`removeFromQueue failed at ${attempt.url} for ${clean}: ${r.status} ${text}`);
+      return 'error';
+    } catch (e) {
+      err(`removeFromQueue network error at ${attempt.url}:`, e.message);
+    }
+  }
+
+  err('No working admin remove/kick endpoint found.');
   return 'error';
 }
 
@@ -419,7 +465,7 @@ async function refreshLiveQueueFromServer() {
   if (!state) return false;
   const rawQueue   = Array.isArray(state.queue)   ? state.queue   : [];
   const rawPlaying = Array.isArray(state.playing) ? state.playing : [];
-  liveQueue   = rawQueue.map((p, i) => ({ name: playerName(p), position: i + 1 })).filter(p => p.name);
+  liveQueue   = rawQueue.map((p, i) => ({ name: playerName(p), id: p?.id || p?._id || p?.playerId || p?.queueId || null, position: i + 1 })).filter(p => p.name);
   livePlaying = rawPlaying.map(p => ({ name: playerName(p) })).filter(p => p.name);
   return true;
 }
@@ -620,7 +666,7 @@ function registerTikTokEvents(entry) {
     const msg      = String(data.comment || '').trim();
     const lower    = msg.toLowerCase();
 
-    const isCmd = lower === '!c' || lower === '!p' || lower === '!help' || lower === '!queue' || lower.startsWith('!q');
+    const isCmd = lower === '!c' || lower === '!clear' || lower === '!r' || lower === '!reset' || lower === '!p' || lower === '!help' || lower === '!queue' || lower.startsWith('!q');
     if (!isCmd) return;
 
     if (BANNED_TIKTOK_USERS.has(tiktokId)) {
@@ -635,27 +681,75 @@ function registerTikTokEvents(entry) {
     setCooldown(tiktokId);
 
     if (lower === '!help') {
-      respond(tiktokId, '!q <name> = join queue | !q = rejoin | !p = position | !c = clear saved name', sourceUsername);
+      respond(tiktokId, '!q <name> = save name + join | !q = rejoin | !p = position | !c = clear from queue | !r = reset saved name', sourceUsername);
       cmd(`[${sourceUsername}] [!help] @${display}`);
       return;
     }
 
-    if (lower === '!c') {
+    if (lower === '!c' || lower === '!clear') {
       const record = getRecord(users, tiktokId);
       if (!record.name) {
-        respond(tiktokId, 'You have no saved name to clear.', sourceUsername);
+        respond(tiktokId, 'You have no saved name. Use !q <YourName> to join the queue.', sourceUsername);
         cmd(`[${sourceUsername}] [!c] @${display} — no saved name`);
         return;
       }
-      if (ownNameIsActive(record)) {
-        respond(tiktokId, `${record.name} is still active in queue/playing. Ask the host to remove you first.`, sourceUsername);
-        cmd(`[${sourceUsername}] [!c] @${display} blocked clear while active as ${record.name}`);
+
+      await refreshLiveQueueFromServer();
+
+      if (isPlaying(record.name)) {
+        respond(tiktokId, `${record.name} is currently playing. Ask the host to clear playing when the match is done.`, sourceUsername);
+        cmd(`[${sourceUsername}] [!c] @${display} blocked while playing as ${record.name}`);
         return;
       }
+
+      if (!isInQueue(record.name)) {
+        setRecord(users, tiktokId, { name: record.name, queued: false });
+        respond(tiktokId, `${record.name} is not in the queue. Your saved name is still set. Use !q to rejoin or !r to reset it.`, sourceUsername);
+        cmd(`[${sourceUsername}] [!c] @${display} (${record.name}) — not in queue`);
+        return;
+      }
+
+      const result = await removeFromQueue(record.name);
+      if (result === 'removed' || result === 'not_found') {
+        setRecord(users, tiktokId, { name: record.name, queued: false });
+        respond(tiktokId, `${record.name} cleared from the queue. Saved name kept. Type !q to rejoin or !r to reset your name.`, sourceUsername);
+        ok(`[${sourceUsername}] [!c] @${display} removed ${record.name} from queue`);
+      } else {
+        respond(tiktokId, `Could not clear ${record.name} from the queue. Ask the host to remove it.`, sourceUsername);
+        err(`[${sourceUsername}] [!c] @${display} failed to remove ${record.name}`);
+      }
+      return;
+    }
+
+    if (lower === '!r' || lower === '!reset') {
+      const record = getRecord(users, tiktokId);
+      if (!record.name) {
+        respond(tiktokId, 'You have no saved name to reset. Use !q <YourName> to set one.', sourceUsername);
+        cmd(`[${sourceUsername}] [!r] @${display} — no saved name`);
+        return;
+      }
+
+      await refreshLiveQueueFromServer();
+
+      if (isPlaying(record.name)) {
+        respond(tiktokId, `${record.name} is currently playing. Ask the host to clear playing before resetting your name.`, sourceUsername);
+        cmd(`[${sourceUsername}] [!r] @${display} blocked while playing as ${record.name}`);
+        return;
+      }
+
+      if (isInQueue(record.name)) {
+        const removeResult = await removeFromQueue(record.name);
+        if (removeResult !== 'removed' && removeResult !== 'not_found') {
+          respond(tiktokId, `Could not remove ${record.name} from the queue, so I did not reset your saved name. Ask the host to remove it.`, sourceUsername);
+          err(`[${sourceUsername}] [!r] @${display} failed to remove active queue name ${record.name}`);
+          return;
+        }
+      }
+
       const old = record.name;
       setRecord(users, tiktokId, { name: '', queued: false });
-      respond(tiktokId, `Cleared saved name "${old}". Use !q <name> to set a new one.`, sourceUsername);
-      cmd(`[${sourceUsername}] [!c] @${display} cleared "${old}"`);
+      respond(tiktokId, `Reset saved name "${old}". Use !q <NewUbisoftName> to set a new one.`, sourceUsername);
+      cmd(`[${sourceUsername}] [!r] @${display} reset "${old}"`);
       return;
     }
 
@@ -730,7 +824,7 @@ function registerTikTokEvents(entry) {
 
     if (record.name) {
       if (isNameTakenByOther(record.name, tiktokId)) {
-        respond(tiktokId, `"${record.name}" is taken. Use !c to clear your name after the host removes the old slot.`, sourceUsername);
+        respond(tiktokId, `"${record.name}" is taken. Use !r to reset your saved name after the host removes the old slot.`, sourceUsername);
         cmd(`[${sourceUsername}] [!q] @${display} ✗ saved name "${record.name}" taken by another`);
         return;
       }
