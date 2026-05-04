@@ -175,9 +175,22 @@ connectTikTok();
 tiktok.on('chat', async (data) => {
   const tiktokId = data.uniqueId;
   const msg      = (data.comment || '').trim();
+  const lower    = msg.toLowerCase();
+
+  // ── !c — clear saved name ──────────────────────────────────────────────
+  if (lower === '!c') {
+    const record = getRecord(users, tiktokId);
+    if (!record.name) {
+      console.log(`[!c] ${tiktokId} has no saved name to clear`);
+      return;
+    }
+    console.log(`[!c] ${tiktokId} cleared saved name "${record.name}"`);
+    setRecord(users, tiktokId, { name: '', queued: false });
+    return;
+  }
 
   // ── !p — check queue position ──────────────────────────────────────────
-  if (msg.toLowerCase() === '!p') {
+  if (lower === '!p') {
     const record = getRecord(users, tiktokId);
 
     if (!record.name) {
@@ -195,7 +208,6 @@ tiktok.on('chat', async (data) => {
       const total = liveQueue.length;
       console.log(`[!p] ${tiktokId} (${record.name}) → Position ${pos} of ${total}`);
     } else {
-      // Not in queue — reset queued flag if it was stale
       if (record.queued) {
         setRecord(users, tiktokId, { name: record.name, queued: false });
       }
@@ -205,7 +217,7 @@ tiktok.on('chat', async (data) => {
   }
 
   // ── !q — join / rejoin queue ───────────────────────────────────────────
-  if (!msg.toLowerCase().startsWith('!q')) return;
+  if (!lower.startsWith('!q')) return;
 
   const typedName = msg.split(/\s+/).slice(1).join('').trim();
   const record    = getRecord(users, tiktokId);
@@ -222,6 +234,12 @@ tiktok.on('chat', async (data) => {
     const clean = cleanName(typedName);
     if (!clean) {
       console.log(`[!q] ${tiktokId} typed invalid name: "${typedName}"`);
+      return;
+    }
+
+    // Check if this name is already taken by someone else in the live queue
+    if (isNameTakenByOther(clean, tiktokId)) {
+      console.log(`[!q] ✗ ${tiktokId} → name "${clean}" is already in the queue`);
       return;
     }
 
@@ -245,6 +263,12 @@ tiktok.on('chat', async (data) => {
 
   // ── Case 3: !q with no name — use saved name ──────────────────────────
   if (record.name) {
+    // Check if someone else already has this name in the queue
+    if (isNameTakenByOther(record.name, tiktokId)) {
+      console.log(`[!q] ✗ ${tiktokId} → name "${record.name}" is already taken. Use !c to clear and pick a new name.`);
+      return;
+    }
+
     const result = await addToQueue(record.name);
     if (result === 'added') {
       setRecord(users, tiktokId, { name: record.name, queued: true });
