@@ -5,13 +5,11 @@ const fs = require("fs");
 // =====================
 // CONFIG
 // =====================
-const TIKTOK_USERNAME = "fsblaker"; // TikTok username WITHOUT @
-const QUEUE_API_URL = "https://siegequeue.com/api/admin/add";
+const TIKTOK_USERNAME = process.env.TIKTOK_USERNAME || "fsblaker";
+const QUEUE_API_URL = process.env.QUEUE_API_URL || "https://siegequeue.com/api/admin/add";
 
-// IMPORTANT:
-// This secret must match whatever your server checks for admin requests.
-// Do NOT put this file in your public website folder.
-const ADMIN_SECRET = "YOUR_ADMIN_SECRET_HERE";
+// This looks for ADMIN_PASSWORD first, then ADMIN_SECRET
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || process.env.ADMIN_SECRET || "";
 
 const DATA_FILE = "./users.json";
 
@@ -59,12 +57,19 @@ async function addToQueue(name, tiktokUser) {
     return;
   }
 
+  if (!ADMIN_PASSWORD) {
+    console.error("Missing ADMIN_PASSWORD variable in Railway");
+    return;
+  }
+
   try {
     const res = await fetch(QUEUE_API_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "x-admin-secret": ADMIN_SECRET
+        "x-admin-password": ADMIN_PASSWORD,
+        "x-admin-secret": ADMIN_PASSWORD,
+        "authorization": `Bearer ${ADMIN_PASSWORD}`
       },
       body: JSON.stringify({ name: clean })
     });
