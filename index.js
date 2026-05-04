@@ -6,33 +6,74 @@ const fs    = require('fs');
 
 // ── Config ─────────────────────────────────────────────────────────────────
 
-const TIKTOK_USERNAME = process.env.TIKTOK_USERNAME || 'fsblaker';
-const BASE_URL        = (process.env.QUEUE_API_URL || 'https://siegequeue.com').replace(/\/api.*$/, '');
-const ADMIN_PASSWORD  = process.env.ADMIN_PASSWORD || process.env.ADMIN_SECRET || '';
-const DATA_FILE       = './users.json';
-const POLL_MS         = 5_000; // how often to fetch live queue state
+const TIKTOK_USERNAME  = process.env.TIKTOK_USERNAME  || 'fsblaker';
+const BASE_URL         = (process.env.QUEUE_API_URL || 'https://siegequeue.com').replace(/\/api.*$/, '');
+const ADMIN_PASSWORD   = process.env.ADMIN_PASSWORD   || process.env.ADMIN_SECRET || '';
+const SESSION_ID       = process.env.TIKTOK_SESSION_ID || ''; // ← fix for InitialFetchError
+const DATA_FILE        = './users.json';
+const POLL_MS          = 5_000;
+const COOLDOWN_MS      = 8_000;   // per-user command cooldown (ms)
+const MAX_RETRY_MS     = 120_000; // cap reconnect delay at 2 min
+
+// ── Terminal colours ────────────────────────────────────────────────────────
+
+const C = {
+  reset  : '\x1b[0m',
+  bold   : '\x1b[1m',
+  dim    : '\x1b[2m',
+  green  : '\x1b[32m',
+  yellow : '\x1b[33m',
+  cyan   : '\x1b[36m',
+  red    : '\x1b[31m',
+  magenta: '\x1b[35m',
+  blue   : '\x1b[34m',
+};
+
+function ts()    { return new Date().toLocaleTimeString(); }
+function log(tag, color, ...args) {
+  console.log(`${C.dim}[${ts()}]${C.reset} ${color}${tag}${C.reset}`, ...args);
+}
+const info  = (...a) => log('INFO ', C.cyan,    ...a);
+const ok    = (...a) => log('OK   ', C.green,   ...a);
+const warn  = (...a) => log('WARN ', C.yellow,  ...a);
+const err   = (...a) => log('ERR  ', C.red,     ...a);
+const cmd   = (...a) => log('CMD  ', C.magenta, ...a);
+const poll  = (...a) => log('POLL ', C.blue,    ...a);
+
+// ── Startup banner ──────────────────────────────────────────────────────────
+
+function printBanner() {
+  console.log(`
+${C.cyan}${C.bold}╔══════════════════════════════════════════╗
+║       TikTok Queue Bot  •  siegequeue    ║
+╚══════════════════════════════════════════╝${C.reset}
+  User  : ${C.yellow}@${TIKTOK_USERNAME}${C.reset}
+  API   : ${C.yellow}${BASE_URL}${C.reset}
+  Auth  : ${ADMIN_PASSWORD ? `${C.green}✓ set${C.reset}` : `${C.red}✗ missing${C.reset}`}
+  Cookie: ${SESSION_ID     ? `${C.green}✓ set${C.reset}` : `${C.yellow}⚠ not set (may fail if stream is private)${C.reset}`}
+
+  ${C.dim}Commands: !q <name>  •  !q  •  !p  •  !c  •  !help${C.reset}
+`);
+}
 
 // ── Persistent user store ───────────────────────────────────────────────────
-// Saves: tiktokId → { name, queued }
-// "name"   = their saved Ubisoft/game name
-// "queued" = whether we believe they are currently in the queue
 
 function loadUsers() {
   try {
     if (fs.existsSync(DATA_FILE)) return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-  } catch (e) { console.error('Could not load users.json:', e.message); }
+  } catch (e) { err('Could not load users.json:', e.message); }
   return {};
 }
 
 function saveUsers(users) {
   try { fs.writeFileSync(DATA_FILE, JSON.stringify(users, null, 2)); }
-  catch (e) { console.error('Could not save users.json:', e.message); }
+  catch (e) { err('Could not save users.json:', e.message); }
 }
 
 function getRecord(users, tiktokId) {
   const r = users[tiktokId];
   if (!r) return { name: '', queued: false };
-  if (typeof r === 'string') return { name: r, queued: false }; // legacy
+  if (typeof r === 'string') return { name: r, queued: false }; // legacy migration
   return { name: r.name || '', queued: Boolean(r.queued) };
 }
 
@@ -57,7 +98,6 @@ function authHeaders() {
   return { 'Content-Type': 'application/json', 'x-admin-password': ADMIN_PASSWORD };
 }
 
-/** Fetch the live queue state — returns { queue, playing } or null on failure. */
 async function fetchQueueState() {
   try {
     const r = await fetch(`${BASE_URL}/api/state`, { timeout: 8_000 });
@@ -73,7 +113,7 @@ async function fetchQueueState() {
 async function addToQueue(name) {
   const clean = cleanName(name);
   if (!clean) return 'error';
-  if (!ADMIN_PASSWORD) { console.error('ADMIN_PASSWORD not set'); return 'error'; }
+  if (!ADMIN_PASSWORD) { err('ADMIN_PASSWORD not set — cannot add to queue'); return 'error'; }
 
   try {
     const r = await fetch(`${BASE_URL}/api/admin/add-to-queue`, {
@@ -85,18 +125,19 @@ async function addToQueue(name) {
     const text = await r.text();
     if (r.ok) return 'added';
     if (text.includes('already') || text.includes('taken') || text.includes('queue')) return 'already';
-    console.error(`addToQueue failed for ${clean}: ${r.status} ${text}`);
+    err(`addToQueue failed for ${clean}: ${r.status} ${text}`);
     return 'error';
   } catch (e) {
-    console.error('addToQueue error:', e.message);
+    err('addToQueue network error:', e.message);
     return 'error';
   }
 }
 
-// ── Live queue state (in-memory, refreshed by poller) ─────────────────────
+// ── Live queue state (refreshed by poller) ─────────────────────────────────
 
-let liveQueue   = [];   // array of { name, position (1-based) }
-let livePlaying = [];   // array of { name }
+let liveQueue   = [];
+let livePlaying = [];
+let lastPollOk  = false;
 
 function isInQueue(name) {
   const n = name.toLowerCase();
@@ -114,33 +155,54 @@ function getPosition(name) {
   return idx === -1 ? null : idx + 1; // 1-based
 }
 
+/**
+ * Returns true if `name` is in the live queue and is NOT owned by `tiktokId`.
+ * Prevents two TikTok accounts from fighting over the same game name.
+ */
+function isNameTakenByOther(name, tiktokId) {
+  if (!isInQueue(name)) return false;         // not in queue at all → not taken
+  const ownRecord = getRecord(users, tiktokId);
+  return ownRecord.name.toLowerCase() !== name.toLowerCase(); // taken by someone else
+}
+
 // ── Queue state poller ──────────────────────────────────────────────────────
-// Polls the server every POLL_MS and:
-//   1. Updates liveQueue / livePlaying
-//   2. Detects players who were kicked/removed and resets their queued flag
-//      so they can rejoin with !q
 
 const users = loadUsers();
 
 async function pollQueue() {
   const state = await fetchQueueState();
-  if (!state) return;
+
+  if (!state) {
+    if (lastPollOk) warn('Queue API unreachable — will keep retrying…');
+    lastPollOk = false;
+    return;
+  }
+
+  if (!lastPollOk) poll('Queue API back online ✓');
+  lastPollOk = true;
+
+  const prevQueue = new Set(liveQueue.map(p => p.name.toLowerCase()));
 
   liveQueue   = (state.queue   || []).map((p, i) => ({ name: p.name, position: i + 1 }));
   livePlaying = (state.playing || []).map(p => ({ name: p.name }));
 
-  // Build a set of everyone currently in the queue or playing
+  // Log any newly added or removed entries
+  const currQueue = new Set(liveQueue.map(p => p.name.toLowerCase()));
+  for (const n of currQueue) if (!prevQueue.has(n)) poll(`  + ${n} joined queue`);
+  for (const n of prevQueue) if (!currQueue.has(n)) poll(`  - ${n} left queue`);
+
+  // Build set of everyone currently active
   const activeNames = new Set([
     ...liveQueue.map(p => p.name.toLowerCase()),
     ...livePlaying.map(p => p.name.toLowerCase()),
   ]);
 
-  // Any TikTok user we thought was queued but is no longer in the queue → reset
+  // Reset queued flag for anyone who was removed from the queue server-side
   let changed = false;
   for (const [tiktokId, raw] of Object.entries(users)) {
     const record = getRecord(users, tiktokId);
     if (record.queued && record.name && !activeNames.has(record.name.toLowerCase())) {
-      console.log(`↩  ${tiktokId} (${record.name}) was removed from queue — unlocked for rejoin`);
+      warn(`↩  @${tiktokId} (${record.name}) removed from queue — unlocked for rejoin`);
       users[tiktokId] = { name: record.name, queued: false };
       changed = true;
     }
@@ -149,43 +211,110 @@ async function pollQueue() {
 }
 
 setInterval(pollQueue, POLL_MS);
-pollQueue(); // run immediately on startup
+pollQueue();
 
-// ── TikTok bot ─────────────────────────────────────────────────────────────
+// ── Per-user cooldown (anti-spam) ───────────────────────────────────────────
 
-const tiktok = new WebcastPushConnection(TIKTOK_USERNAME);
+const cooldowns = new Map();
+
+function isOnCooldown(tiktokId) {
+  const last = cooldowns.get(tiktokId) || 0;
+  return Date.now() - last < COOLDOWN_MS;
+}
+
+function setCooldown(tiktokId) {
+  cooldowns.set(tiktokId, Date.now());
+}
+
+// ── TikTok connection ───────────────────────────────────────────────────────
+
+const tiktokOptions = {
+  enableExtendedGiftInfo : true,
+  enableWebsocketUpgrade : true,
+  requestPollingIntervalMs: 2_000,
+  ...(SESSION_ID ? { sessionId: SESSION_ID } : {}),
+};
+
+const tiktok = new WebcastPushConnection(TIKTOK_USERNAME, tiktokOptions);
+
+let retryDelay = 15_000;
 
 function connectTikTok() {
+  info(`Connecting to @${TIKTOK_USERNAME}…`);
   tiktok.connect()
-    .then(() => {
-      console.log(`✓ Connected to TikTok Live @${TIKTOK_USERNAME}`);
-      console.log('  Commands: !q YourName  |  !q  |  !p');
+    .then(state => {
+      retryDelay = 15_000; // reset on success
+      ok(`Connected to TikTok Live @${TIKTOK_USERNAME}`);
+      if (state?.roomId) info(`Room ID: ${state.roomId}`);
     })
-    .catch(err => {
-      console.error('✗ TikTok connect failed:', err.message);
-      console.log('  Retrying in 30 seconds…');
-      setTimeout(connectTikTok, 30_000);
+    .catch(e => {
+      // Honour the retryAfter hint from the library if present
+      const hint = e?.exception?.retryAfter ?? e?.retryAfter;
+      const delay = hint ? hint * 1_000 : retryDelay;
+      retryDelay  = Math.min(retryDelay * 2, MAX_RETRY_MS); // exponential back-off
+
+      err(`TikTok connect failed: ${e.message || e}`);
+      if (!SESSION_ID) {
+        warn('Tip: set TIKTOK_SESSION_ID env var to your TikTok sessionid cookie.');
+        warn('     This is often needed for accounts that are live but returning InitialFetchError.');
+      }
+      info(`Retrying in ${delay / 1000}s…`);
+      setTimeout(connectTikTok, delay);
     });
 }
 
-connectTikTok();
+// ── Chat response helper ────────────────────────────────────────────────────
+// tiktok-live-connector is read-only — we can't send chat messages back.
+// All feedback goes to the console. If you later add a Puppeteer/Playwright
+// layer you can swap this out.
+
+function respond(tiktokId, message) {
+  // Prefix with @ so it's easy to spot in the log as an "outbound" response
+  log('CHAT ←', C.cyan, `@${tiktokId}: ${message}`);
+}
 
 // ── Chat handler ────────────────────────────────────────────────────────────
 
 tiktok.on('chat', async (data) => {
   const tiktokId = data.uniqueId;
+  const display  = data.nickname || tiktokId;
   const msg      = (data.comment || '').trim();
   const lower    = msg.toLowerCase();
+
+  // Only handle recognised commands
+  const isCmd = lower === '!c'
+    || lower === '!p'
+    || lower === '!help'
+    || lower.startsWith('!q');
+
+  if (!isCmd) return;
+
+  // Cooldown check (skip for !help)
+  if (lower !== '!help' && isOnCooldown(tiktokId)) {
+    cmd(`[cooldown] @${tiktokId} — ignored (${COOLDOWN_MS / 1000}s cooldown)`);
+    return;
+  }
+  setCooldown(tiktokId);
+
+  // ── !help ──────────────────────────────────────────────────────────────
+  if (lower === '!help') {
+    respond(tiktokId, '!q <name> = join queue | !q = rejoin | !p = check position | !c = clear name');
+    cmd(`[!help] @${display}`);
+    return;
+  }
 
   // ── !c — clear saved name ──────────────────────────────────────────────
   if (lower === '!c') {
     const record = getRecord(users, tiktokId);
     if (!record.name) {
-      console.log(`[!c] ${tiktokId} has no saved name to clear`);
+      respond(tiktokId, 'You have no saved name to clear.');
+      cmd(`[!c] @${display} — no saved name`);
       return;
     }
-    console.log(`[!c] ${tiktokId} cleared saved name "${record.name}"`);
+    const old = record.name;
     setRecord(users, tiktokId, { name: '', queued: false });
+    respond(tiktokId, `Cleared saved name "${old}". Use !q <name> to set a new one.`);
+    cmd(`[!c] @${display} cleared "${old}"`);
     return;
   }
 
@@ -194,24 +323,26 @@ tiktok.on('chat', async (data) => {
     const record = getRecord(users, tiktokId);
 
     if (!record.name) {
-      console.log(`[!p] ${tiktokId} has no saved name — needs to use !q YourName first`);
+      respond(tiktokId, 'No saved name. Use !q <YourName> to join the queue.');
+      cmd(`[!p] @${display} — no saved name`);
       return;
     }
 
     if (isPlaying(record.name)) {
-      console.log(`[!p] ${tiktokId} (${record.name}) → Currently playing!`);
+      respond(tiktokId, `${record.name} is currently playing! Good luck!`);
+      cmd(`[!p] @${display} (${record.name}) → PLAYING`);
       return;
     }
 
     const pos = getPosition(record.name);
     if (pos !== null) {
       const total = liveQueue.length;
-      console.log(`[!p] ${tiktokId} (${record.name}) → Position ${pos} of ${total}`);
+      respond(tiktokId, `${record.name} is #${pos} of ${total} in the queue.`);
+      cmd(`[!p] @${display} (${record.name}) → #${pos}/${total}`);
     } else {
-      if (record.queued) {
-        setRecord(users, tiktokId, { name: record.name, queued: false });
-      }
-      console.log(`[!p] ${tiktokId} (${record.name}) → Not in queue. Type !q to join.`);
+      if (record.queued) setRecord(users, tiktokId, { name: record.name, queued: false });
+      respond(tiktokId, `${record.name} is not in the queue. Type !q to rejoin.`);
+      cmd(`[!p] @${display} (${record.name}) → not in queue`);
     }
     return;
   }
@@ -225,7 +356,8 @@ tiktok.on('chat', async (data) => {
   // ── Case 1: player is actively in the queue right now ─────────────────
   if (record.queued && record.name && isInQueue(record.name)) {
     const pos = getPosition(record.name);
-    console.log(`[!q] ${tiktokId} already in queue as ${record.name} (pos ${pos})`);
+    respond(tiktokId, `${record.name} is already in queue at #${pos}.`);
+    cmd(`[!q] @${display} already queued as ${record.name} (#${pos})`);
     return;
   }
 
@@ -233,67 +365,104 @@ tiktok.on('chat', async (data) => {
   if (typedName) {
     const clean = cleanName(typedName);
     if (!clean) {
-      console.log(`[!q] ${tiktokId} typed invalid name: "${typedName}"`);
+      respond(tiktokId, 'Invalid name. Use letters, numbers, _ . - only (max 20 chars).');
+      cmd(`[!q] @${display} invalid name: "${typedName}"`);
       return;
     }
 
-    // Check if this name is already taken by someone else in the live queue
     if (isNameTakenByOther(clean, tiktokId)) {
-      console.log(`[!q] ✗ ${tiktokId} → name "${clean}" is already in the queue`);
+      respond(tiktokId, `"${clean}" is already in the queue. Try a different name.`);
+      cmd(`[!q] @${display} ✗ name "${clean}" taken by another user`);
       return;
     }
 
-    // Save the new name regardless so future !q / !p works
+    // Save new name immediately
     setRecord(users, tiktokId, { name: clean, queued: false });
-    console.log(`[!q] ${tiktokId} saved name: ${clean}`);
+    cmd(`[!q] @${display} saved name: ${clean}`);
 
     const result = await addToQueue(clean);
     if (result === 'added') {
       setRecord(users, tiktokId, { name: clean, queued: true });
-      const pos = getPosition(clean);
-      console.log(`[!q] ✓ ${tiktokId} → ${clean} added to queue${pos ? ` (pos ${pos})` : ''}`);
+      const pos = getPosition(clean) || '?';
+      respond(tiktokId, `${clean} added to queue! Position: #${pos}`);
+      ok(`[!q] @${display} → ${clean} added (#${pos})`);
     } else if (result === 'already') {
       setRecord(users, tiktokId, { name: clean, queued: true });
-      console.log(`[!q] ${tiktokId} → ${clean} already in queue`);
+      respond(tiktokId, `${clean} is already in the queue.`);
+      cmd(`[!q] @${display} → ${clean} already in queue`);
     } else {
-      console.log(`[!q] ✗ ${tiktokId} → could not add ${clean} to queue`);
+      respond(tiktokId, `Could not add "${clean}" to the queue. Try again shortly.`);
+      err(`[!q] @${display} → could not add ${clean}`);
     }
     return;
   }
 
   // ── Case 3: !q with no name — use saved name ──────────────────────────
   if (record.name) {
-    // Check if someone else already has this name in the queue
     if (isNameTakenByOther(record.name, tiktokId)) {
-      console.log(`[!q] ✗ ${tiktokId} → name "${record.name}" is already taken. Use !c to clear and pick a new name.`);
+      respond(tiktokId, `"${record.name}" is taken. Use !c to clear your name and pick a new one.`);
+      cmd(`[!q] @${display} ✗ saved name "${record.name}" taken by another`);
       return;
     }
 
     const result = await addToQueue(record.name);
     if (result === 'added') {
       setRecord(users, tiktokId, { name: record.name, queued: true });
-      const pos = getPosition(record.name);
-      console.log(`[!q] ✓ ${tiktokId} → ${record.name} rejoined queue${pos ? ` (pos ${pos})` : ''}`);
+      const pos = getPosition(record.name) || '?';
+      respond(tiktokId, `${record.name} rejoined the queue at #${pos}!`);
+      ok(`[!q] @${display} → ${record.name} rejoined (#${pos})`);
     } else if (result === 'already') {
       setRecord(users, tiktokId, { name: record.name, queued: true });
-      console.log(`[!q] ${tiktokId} → ${record.name} already in queue`);
+      respond(tiktokId, `${record.name} is already in the queue.`);
+      cmd(`[!q] @${display} → ${record.name} already in queue`);
     } else {
-      console.log(`[!q] ✗ ${tiktokId} → could not add ${record.name} to queue`);
+      respond(tiktokId, `Could not rejoin queue as "${record.name}". Try again shortly.`);
+      err(`[!q] @${display} → could not add ${record.name}`);
     }
     return;
   }
 
   // ── Case 4: no name at all ─────────────────────────────────────────────
-  console.log(`[!q] ${tiktokId} has no saved name — needs !q YourName`);
+  respond(tiktokId, 'No saved name! Type !q <YourUbisoftName> to join the queue.');
+  cmd(`[!q] @${display} — no saved name`);
 });
 
 // ── Connection events ───────────────────────────────────────────────────────
 
 tiktok.on('disconnected', () => {
-  console.log('TikTok disconnected — reconnecting in 15 seconds…');
+  warn('TikTok disconnected — reconnecting in 15 seconds…');
+  retryDelay = 15_000;
   setTimeout(connectTikTok, 15_000);
 });
 
-tiktok.on('error', err => {
-  console.error('TikTok error:', err.message || err);
+tiktok.on('error', e => {
+  err('TikTok stream error:', e.message || JSON.stringify(e));
 });
+
+tiktok.on('roomUser', d => {
+  if (d?.viewerCount != null) info(`Viewers: ${d.viewerCount}`);
+});
+
+// ── Graceful shutdown ───────────────────────────────────────────────────────
+
+function shutdown(signal) {
+  warn(`\nReceived ${signal} — saving state and exiting…`);
+  saveUsers(users);
+  process.exit(0);
+}
+
+process.on('SIGINT',  () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+// ── Stats printer (every 5 min) ─────────────────────────────────────────────
+
+setInterval(() => {
+  const knownUsers = Object.keys(users).length;
+  const queued     = Object.values(users).filter(r => r?.queued).length;
+  info(`Stats — known users: ${knownUsers}, queued: ${queued}, live queue length: ${liveQueue.length}`);
+}, 5 * 60_000);
+
+// ── Start ───────────────────────────────────────────────────────────────────
+
+printBanner();
+connectTikTok();
