@@ -7,8 +7,6 @@ const fs = require("fs");
 // =====================
 const TIKTOK_USERNAME = process.env.TIKTOK_USERNAME || "fsblaker";
 const QUEUE_API_URL = process.env.QUEUE_API_URL || "https://siegequeue.com/api/admin/add";
-
-// This looks for ADMIN_PASSWORD first, then ADMIN_SECRET
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || process.env.ADMIN_SECRET || "";
 
 const DATA_FILE = "./users.json";
@@ -36,13 +34,46 @@ function saveUsers(users) {
   }
 }
 
+function getUserRecord(users, tiktokUser) {
+  const old = users[tiktokUser];
+
+  if (!old) {
+    return {
+      name: "",
+      queued: false
+    };
+  }
+
+  if (typeof old === "string") {
+    return {
+      name: old,
+      queued: false
+    };
+  }
+
+  return {
+    name: old.name || "",
+    queued: Boolean(old.queued)
+  };
+}
+
+function setUserRecord(users, tiktokUser, record) {
+  users[tiktokUser] = {
+    name: record.name || "",
+    queued: Boolean(record.queued)
+  };
+
+  saveUsers(users);
+}
+
 // =====================
 // NAME CLEANUP
 // =====================
 function cleanName(name) {
   return String(name || "")
     .trim()
-    .replace(/\s+/g, " ")
+    .replace(/\s+/g, "_")
+    .replace(/[^a-zA-Z0-9_.-]/g, "")
     .slice(0, 20);
 }
 
@@ -54,12 +85,18 @@ async function addToQueue(name, tiktokUser) {
 
   if (!clean) {
     console.log(`No valid name for ${tiktokUser}`);
-    return;
+    return {
+      ok: false,
+      alreadyQueued: false
+    };
   }
 
   if (!ADMIN_PASSWORD) {
     console.error("Missing ADMIN_PASSWORD variable in Railway");
-    return;
+    return {
+      ok: false,
+      alreadyQueued: false
+    };
   }
 
   try {
@@ -69,7 +106,7 @@ async function addToQueue(name, tiktokUser) {
         "Content-Type": "application/json",
         "x-admin-password": ADMIN_PASSWORD,
         "x-admin-secret": ADMIN_PASSWORD,
-        "authorization": `Bearer ${ADMIN_PASSWORD}`
+        authorization: `Bearer ${ADMIN_PASSWORD}`
       },
       body: JSON.stringify({ name: clean })
     });
@@ -78,12 +115,33 @@ async function addToQueue(name, tiktokUser) {
 
     if (!res.ok) {
       console.error(`Failed to add ${clean}: ${res.status} ${text}`);
-      return;
+
+      if (text.includes("Already in queue or playing")) {
+        return {
+          ok: false,
+          alreadyQueued: true
+        };
+      }
+
+      return {
+        ok: false,
+        alreadyQueued: false
+      };
     }
 
     console.log(`Added to queue: ${clean} from TikTok user ${tiktokUser}`);
+
+    return {
+      ok: true,
+      alreadyQueued: false
+    };
   } catch (err) {
     console.error("Failed to add to queue:", err);
+
+    return {
+      ok: false,
+      alreadyQueued: false
+    };
   }
 }
 
@@ -112,28 +170,64 @@ tiktok.on("chat", async (data) => {
 
   if (!message.toLowerCase().startsWith("!q")) return;
 
-  const parts = message.split(" ");
-  const typedName = parts.slice(1).join(" ").trim();
+  const typedName = message.split(" ").slice(1).join(" ").trim();
+  const record = getUserRecord(users, tiktokUser);
 
-  if (typedName) {
-    const savedName = cleanName(typedName);
-
-    users[tiktokUser] = savedName;
-    saveUsers(users);
-
-    console.log(`${tiktokUser} saved name as ${savedName}`);
-    await addToQueue(savedName, tiktokUser);
+  // If this TikTok user already got in, block more names.
+  if (record.queued) {
+    console.log(
+      `${tiktokUser} tried to add another name, but they are already locked as ${record.name}`
+    );
     return;
   }
 
-  const savedName = users[tiktokUser];
+  // First-time name save
+  if (typedName) {
+    const savedName = cleanName(typedName);
 
-  if (savedName) {
-    console.log(`${tiktokUser} used saved name ${savedName}`);
-    await addToQueue(savedName, tiktokUser);
+    if (!savedName) {
+      console.log(`${tiktokUser} typed an invalid name`);
+      return;
+    }
+
+    const result = await addToQueue(savedName, tiktokUser);
+
+    if (result.ok || result.alreadyQueued) {
+      setUserRecord(users, tiktokUser, {
+        name: savedName,
+        queued: true
+      });
+
+      console.log(`${tiktokUser} is now locked as ${savedName}`);
+    }
+
+    return;
+  }
+
+  // Using saved name with !q
+  if (record.name) {
+    const result = await addToQueue(record.name, tiktokUser);
+
+    if (result.ok || result.alreadyQueued) {
+      setUserRecord(users, tiktokUser, {
+        name: record.name,
+        queued: true
+      });
+
+      console.log(`${tiktokUser} is now locked as ${record.name}`);
+    }
+
     return;
   }
 
   console.log(`${tiktokUser} typed !q but has no saved name yet`);
   console.log(`They need to type: !q theirName`);
+});
+
+tiktok.on("disconnected", () => {
+  console.log("TikTok disconnected. Restart the Railway deployment if needed.");
+});
+
+tiktok.on("error", (err) => {
+  console.error("TikTok connection error:", err);
 });
