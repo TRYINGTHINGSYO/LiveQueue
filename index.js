@@ -27,18 +27,36 @@ function parseTikTokUserList(value) {
     .filter(Boolean);
 }
 
+function envBool(value, fallback = true) {
+  if (value === undefined || value === null || value === '') return fallback;
+  const v = String(value).trim().toLowerCase();
+  if (['1', 'true', 'yes', 'y', 'on', 'enabled'].includes(v)) return true;
+  if (['0', 'false', 'no', 'n', 'off', 'disabled'].includes(v)) return false;
+  return fallback;
+}
+
+function cfgBool(value, fallback = true) {
+  if (value === undefined || value === null) return fallback;
+  return envBool(value, fallback);
+}
+
 function uniqueTikTokUsers(list) {
   return [...new Set(list.map(normalizeTikTokUsername).filter(Boolean))];
 }
 
 function getStreamUsers() {
-  return uniqueTikTokUsers([TIKTOK_USERNAME, ...EXTRA_TIKTOK_USERNAMES]);
+  const list = [];
+  if (TIKTOK_USERNAME_ENABLED) list.push(TIKTOK_USERNAME);
+  if (TIKTOK_USERNAME_2_ENABLED) list.push(...EXTRA_TIKTOK_USERNAMES);
+  return uniqueTikTokUsers(list);
 }
 
-let TIKTOK_USERNAME  = normalizeTikTokUsername(process.env.TIKTOK_USERNAME || 'fsblaker');
+let TIKTOK_USERNAME = normalizeTikTokUsername(process.env.TIKTOK_USERNAME || 'fsblaker');
+let TIKTOK_USERNAME_ENABLED = envBool(process.env.TIKTOK_USERNAME_ENABLED, Boolean(TIKTOK_USERNAME));
 let EXTRA_TIKTOK_USERNAMES = parseTikTokUserList(
   process.env.EXTRA_TIKTOK_USERNAMES || process.env.TIKTOK_USERNAME_2 || 'barbariandino'
 );
+let TIKTOK_USERNAME_2_ENABLED = envBool(process.env.TIKTOK_USERNAME_2_ENABLED, EXTRA_TIKTOK_USERNAMES.length > 0);
 const BASE_URL       = (process.env.QUEUE_API_URL || 'https://siegequeue.com').replace(/\/api.*$/, '').replace(/\/$/, '');
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || process.env.ADMIN_SECRET || '';
 const SESSION_ID     = process.env.TIKTOK_SESSION_ID || '';
@@ -80,7 +98,9 @@ function printBanner() {
 ${C.cyan}${C.bold}╔══════════════════════════════════════════╗
 ║       TikTok Queue Bot  •  siegequeue    ║
 ╚══════════════════════════════════════════╝${C.reset}
-  Users : ${C.yellow}${getStreamUsers().map(u => '@' + u).join(' + ')}${C.reset}
+  Users : ${C.yellow}${getStreamUsers().length ? getStreamUsers().map(u => '@' + u).join(' + ') : 'none enabled'}${C.reset}
+  Main  : ${TIKTOK_USERNAME_ENABLED ? C.green + 'ON ' + C.reset : C.red + 'OFF' + C.reset} @${TIKTOK_USERNAME || 'not set'}
+  Extra : ${TIKTOK_USERNAME_2_ENABLED ? C.green + 'ON ' + C.reset : C.red + 'OFF' + C.reset} ${EXTRA_TIKTOK_USERNAMES.map(u => '@' + u).join(', ') || 'none'}
   API   : ${C.yellow}${BASE_URL}${C.reset}
   Auth  : ${ADMIN_PASSWORD ? `${C.green}✓ set${C.reset}` : `${C.red}✗ missing${C.reset}`}
   Cookie: ${SESSION_ID ? `${C.green}✓ set${C.reset}` : `${C.yellow}⚠ not set (may fail if stream is private)${C.reset}`}
@@ -226,7 +246,7 @@ async function addToQueue(name) {
 // ── Server config sync ──────────────────────────────────────────────────────
 
 let _pollIntervalHandle = null;
-let _lastConfigUsername = TIKTOK_USERNAME;
+let _lastStreamUsersKey = JSON.stringify(getStreamUsers());
 
 /**
  * Fetch bot config from the server admin panel.
@@ -274,13 +294,35 @@ async function fetchBotConfigFromServer() {
       }
     }
 
-    // Primary username from admin panel — reconnect if changed.
-    // Extra usernames still come from env: TIKTOK_USERNAME_2 or EXTRA_TIKTOK_USERNAMES.
-    if (typeof cfg.username === 'string' && normalizeTikTokUsername(cfg.username) && normalizeTikTokUsername(cfg.username) !== _lastConfigUsername) {
-      const newUsername = normalizeTikTokUsername(cfg.username);
-      info(`[sync] Primary TikTok username changed: ${_lastConfigUsername} → ${newUsername}`);
-      TIKTOK_USERNAME = newUsername;
-      _lastConfigUsername = newUsername;
+    // TikTok usernames + enabled toggles from the admin panel.
+    // The admin can turn either live chat on/off without removing the saved usernames.
+    const beforeUsersKey = JSON.stringify(getStreamUsers());
+
+    if (typeof cfg.username === 'string') {
+      const nextPrimary = normalizeTikTokUsername(cfg.username);
+      if (nextPrimary) TIKTOK_USERNAME = nextPrimary;
+    }
+
+    // Missing enabled fields default to true for backwards compatibility with older admin files.
+    TIKTOK_USERNAME_ENABLED = cfgBool(cfg.usernameEnabled ?? cfg.primaryEnabled ?? cfg.enabled, Boolean(TIKTOK_USERNAME));
+
+    const rawExtraUsers = Array.isArray(cfg.extraUsernames)
+      ? cfg.extraUsernames
+      : [cfg.username2 ?? cfg.secondaryUsername ?? cfg.extraUsername].filter(Boolean);
+    const nextExtraUsers = uniqueTikTokUsers(rawExtraUsers);
+    if (nextExtraUsers.length || 'username2' in cfg || 'secondaryUsername' in cfg || 'extraUsernames' in cfg) {
+      EXTRA_TIKTOK_USERNAMES = nextExtraUsers;
+    }
+
+    TIKTOK_USERNAME_2_ENABLED = cfgBool(
+      cfg.username2Enabled ?? cfg.secondaryEnabled ?? cfg.extraUsernamesEnabled ?? cfg.extraEnabled,
+      EXTRA_TIKTOK_USERNAMES.length > 0
+    );
+
+    const afterUsersKey = JSON.stringify(getStreamUsers());
+    if (afterUsersKey !== beforeUsersKey || afterUsersKey !== _lastStreamUsersKey) {
+      info(`[sync] TikTok streams now enabled: ${getStreamUsers().length ? getStreamUsers().map(u => '@' + u).join(', ') : 'none'}`);
+      _lastStreamUsersKey = afterUsersKey;
       rebuildTikTokConnections();
       connectAllTikTok();
     }
@@ -311,6 +353,20 @@ async function postBotStatusToServer(extra = {}) {
         knownUsers,
         queuedRecords,
         liveQueueLen : liveQueue.length,
+        streams      : [...streams.values()].map(s => ({
+          username: s.username,
+          connected: Boolean(s.connected),
+          connecting: Boolean(s.connecting),
+          viewers: Number(s.currentViewers || 0),
+          roomId: s.currentRoomId || null,
+        })),
+        usernames: {
+          username: TIKTOK_USERNAME,
+          usernameEnabled: TIKTOK_USERNAME_ENABLED,
+          username2: EXTRA_TIKTOK_USERNAMES[0] || '',
+          username2Enabled: TIKTOK_USERNAME_2_ENABLED,
+          extraUsernames: EXTRA_TIKTOK_USERNAMES,
+        },
       }),
     }, 5_000);
   } catch (_) { /* non-critical */ }
@@ -488,6 +544,8 @@ function rebuildTikTokConnections() {
 }
 
 function scheduleReconnect(username, delayMs) {
+  username = normalizeTikTokUsername(username);
+  if (!getStreamUsers().includes(username)) return;
   const entry = ensureStream(username);
   if (!entry) return;
   if (entry.reconnectTimer) clearTimeout(entry.reconnectTimer);
@@ -498,8 +556,10 @@ function scheduleReconnect(username, delayMs) {
 }
 
 function connectTikTok(username) {
+  username = normalizeTikTokUsername(username);
+  if (!getStreamUsers().includes(username)) return;
   const entry = ensureStream(username);
-  if (!entry || entry.connecting) return;
+  if (!entry || entry.connecting || entry.connected) return;
 
   entry.connecting = true;
   info(`Connecting to @${entry.username}…`);
@@ -534,7 +594,13 @@ function connectTikTok(username) {
 
 function connectAllTikTok() {
   rebuildTikTokConnections();
-  for (const username of getStreamUsers()) connectTikTok(username);
+  const activeUsers = getStreamUsers();
+  if (!activeUsers.length) {
+    warn('No TikTok accounts are enabled. Turn one on in the admin panel to start watching chat.');
+    postBotStatusToServer({ connected: false, connecting: false, error: 'No TikTok accounts enabled' });
+    return;
+  }
+  for (const username of activeUsers) connectTikTok(username);
 }
 
 // tiktok-live-connector is read-only; this logs what the bot would say.
@@ -746,7 +812,7 @@ setInterval(fetchBotConfigFromServer, 60_000);
 setInterval(() => {
   const knownUsers    = Object.keys(users).length;
   const queued        = Object.values(users).filter(r => r?.queued).length;
-  info(`Stats — streams: ${getStreamUsers().map(u => '@' + u).join(', ')}, known users: ${knownUsers}, queued records: ${queued}, live queue: ${liveQueue.length}, playing: ${livePlaying.length}, viewers: ${currentViewers}`);
+  info(`Stats — enabled streams: ${getStreamUsers().map(u => '@' + u).join(', ') || 'none'}, known users: ${knownUsers}, queued records: ${queued}, live queue: ${liveQueue.length}, playing: ${livePlaying.length}, viewers: ${currentViewers}`);
 }, 5 * 60_000);
 
 // ── Start ───────────────────────────────────────────────────────────────────
