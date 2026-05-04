@@ -134,6 +134,10 @@ function getRecord(users, tiktokId) {
 function setRecord(users, tiktokId, record) {
   users[tiktokId] = { name: record.name || '', queued: Boolean(record.queued) };
   saveUsers(users);
+  // Keep the admin panel's TikTok Saved Names list current after !q, !c, or !r.
+  setTimeout(() => {
+    try { postBotStatusToServer().catch(() => {}); } catch (_) {}
+  }, 0);
 }
 
 // ── Name sanitiser and filters ──────────────────────────────────────────────
@@ -377,6 +381,41 @@ async function fetchBotConfigFromServer() {
   }
 }
 
+function getSavedUsersForAdmin() {
+  const activeNames = new Set([
+    ...liveQueue.map(p => p.name.toLowerCase()),
+    ...livePlaying.map(p => p.name.toLowerCase()),
+  ]);
+
+  return Object.entries(users)
+    .map(([tiktok, raw]) => {
+      const record = getRecord(users, tiktok);
+      const name = String(record.name || '').trim();
+      if (!name) return null;
+
+      const pos = getPosition(name);
+      const playing = isPlaying(name);
+      const queued = pos !== null;
+      const active = activeNames.has(name.toLowerCase());
+
+      return {
+        tiktok,
+        tiktokUsername: tiktok,
+        username: tiktok,
+        ubisoft: name,
+        ubisoftName: name,
+        name,
+        queued,
+        playing,
+        active,
+        position: pos,
+        status: playing ? 'playing' : queued ? 'queued' : record.queued ? 'saved' : 'saved',
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.tiktok.localeCompare(b.tiktok));
+}
+
 /**
  * Post the bot's current live status to the server.
  */
@@ -384,6 +423,7 @@ async function postBotStatusToServer(extra = {}) {
   if (!ADMIN_PASSWORD) return;
   const knownUsers = Object.keys(users).length;
   const queuedRecords = Object.values(users).filter(r => r?.queued).length;
+  const savedUsers = getSavedUsersForAdmin();
   try {
     await fetchWithTimeout(`${BASE_URL}/api/bot/status`, {
       method: 'POST',
@@ -399,6 +439,8 @@ async function postBotStatusToServer(extra = {}) {
         knownUsers,
         queuedRecords,
         liveQueueLen : liveQueue.length,
+        savedUsers,
+        tiktokSavedUsers: savedUsers,
         streams      : [...streams.values()].map(s => ({
           username: s.username,
           connected: Boolean(s.connected),
@@ -500,7 +542,10 @@ async function pollQueue() {
       changed = true;
     }
   }
-  if (changed) saveUsers(users);
+  if (changed) {
+    saveUsers(users);
+    postBotStatusToServer().catch(() => {});
+  }
 }
 
 _pollIntervalHandle = setInterval(pollQueue, POLL_MS);
@@ -710,10 +755,14 @@ function registerTikTokEvents(entry) {
       }
 
       const result = await removeFromQueue(record.name);
-      if (result === 'removed' || result === 'not_found') {
+      if (result === 'removed') {
         setRecord(users, tiktokId, { name: record.name, queued: false });
         respond(tiktokId, `${record.name} cleared from the queue. Saved name kept. Type !q to rejoin or !r to reset your name.`, sourceUsername);
         ok(`[${sourceUsername}] [!c] @${display} removed ${record.name} from queue`);
+      } else if (result === 'not_found') {
+        setRecord(users, tiktokId, { name: record.name, queued: false });
+        respond(tiktokId, `${record.name} was not detected in the queue, so there was nothing to clear. Saved name kept.`, sourceUsername);
+        cmd(`[${sourceUsername}] [!c] @${display} ${record.name} not detected in queue`);
       } else {
         respond(tiktokId, `Could not clear ${record.name} from the queue. Ask the host to remove it.`, sourceUsername);
         err(`[${sourceUsername}] [!c] @${display} failed to remove ${record.name}`);
@@ -738,12 +787,9 @@ function registerTikTokEvents(entry) {
       }
 
       if (isInQueue(record.name)) {
-        const removeResult = await removeFromQueue(record.name);
-        if (removeResult !== 'removed' && removeResult !== 'not_found') {
-          respond(tiktokId, `Could not remove ${record.name} from the queue, so I did not reset your saved name. Ask the host to remove it.`, sourceUsername);
-          err(`[${sourceUsername}] [!r] @${display} failed to remove active queue name ${record.name}`);
-          return;
-        }
+        respond(tiktokId, `${record.name} is still in the queue. Use !c first, then use !r to reset your saved name.`, sourceUsername);
+        cmd(`[${sourceUsername}] [!r] @${display} blocked reset while queued as ${record.name}`);
+        return;
       }
 
       const old = record.name;
