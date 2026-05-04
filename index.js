@@ -16,7 +16,29 @@ try {
 // Env-vars are the baseline defaults.
 // fetchBotConfigFromServer() overwrites these at startup and every ~60 s.
 
-let TIKTOK_USERNAME  = process.env.TIKTOK_USERNAME || 'fsblaker';
+function normalizeTikTokUsername(value) {
+  return String(value || '').trim().replace(/^@+/, '').toLowerCase();
+}
+
+function parseTikTokUserList(value) {
+  return String(value || '')
+    .split(',')
+    .map(normalizeTikTokUsername)
+    .filter(Boolean);
+}
+
+function uniqueTikTokUsers(list) {
+  return [...new Set(list.map(normalizeTikTokUsername).filter(Boolean))];
+}
+
+function getStreamUsers() {
+  return uniqueTikTokUsers([TIKTOK_USERNAME, ...EXTRA_TIKTOK_USERNAMES]);
+}
+
+let TIKTOK_USERNAME  = normalizeTikTokUsername(process.env.TIKTOK_USERNAME || 'fsblaker');
+let EXTRA_TIKTOK_USERNAMES = parseTikTokUserList(
+  process.env.EXTRA_TIKTOK_USERNAMES || process.env.TIKTOK_USERNAME_2 || 'barbariandino'
+);
 const BASE_URL       = (process.env.QUEUE_API_URL || 'https://siegequeue.com').replace(/\/api.*$/, '').replace(/\/$/, '');
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || process.env.ADMIN_SECRET || '';
 const SESSION_ID     = process.env.TIKTOK_SESSION_ID || '';
@@ -58,7 +80,7 @@ function printBanner() {
 ${C.cyan}${C.bold}╔══════════════════════════════════════════╗
 ║       TikTok Queue Bot  •  siegequeue    ║
 ╚══════════════════════════════════════════╝${C.reset}
-  User  : ${C.yellow}@${TIKTOK_USERNAME}${C.reset}
+  Users : ${C.yellow}${getStreamUsers().map(u => '@' + u).join(' + ')}${C.reset}
   API   : ${C.yellow}${BASE_URL}${C.reset}
   Auth  : ${ADMIN_PASSWORD ? `${C.green}✓ set${C.reset}` : `${C.red}✗ missing${C.reset}`}
   Cookie: ${SESSION_ID ? `${C.green}✓ set${C.reset}` : `${C.yellow}⚠ not set (may fail if stream is private)${C.reset}`}
@@ -233,7 +255,7 @@ async function fetchBotConfigFromServer() {
 
     // Banned users
     if (Array.isArray(cfg.bannedUsers)) {
-      BANNED_TIKTOK_USERS = new Set(cfg.bannedUsers);
+      BANNED_TIKTOK_USERS = new Set(cfg.bannedUsers.map(normalizeTikTokUsername).filter(Boolean));
     }
 
     // Blocked names (server stores raw; we normalize here)
@@ -252,15 +274,15 @@ async function fetchBotConfigFromServer() {
       }
     }
 
-    // Username — reconnect if changed
-    if (typeof cfg.username === 'string' && cfg.username && cfg.username !== _lastConfigUsername) {
-      info(`[sync] TikTok username changed: ${_lastConfigUsername} → ${cfg.username}`);
-      TIKTOK_USERNAME = cfg.username;
-      _lastConfigUsername = cfg.username;
-      // Reconnect with new username
-      try { tiktok.disconnect(); } catch (_) {}
-      rebuildTikTokConnection();
-      scheduleReconnect(0);
+    // Primary username from admin panel — reconnect if changed.
+    // Extra usernames still come from env: TIKTOK_USERNAME_2 or EXTRA_TIKTOK_USERNAMES.
+    if (typeof cfg.username === 'string' && normalizeTikTokUsername(cfg.username) && normalizeTikTokUsername(cfg.username) !== _lastConfigUsername) {
+      const newUsername = normalizeTikTokUsername(cfg.username);
+      info(`[sync] Primary TikTok username changed: ${_lastConfigUsername} → ${newUsername}`);
+      TIKTOK_USERNAME = newUsername;
+      _lastConfigUsername = newUsername;
+      rebuildTikTokConnections();
+      connectAllTikTok();
     }
   } catch (e) {
     if (!e.message?.includes('aborted')) warn(`[sync] Config fetch error: ${e.message}`);
@@ -388,7 +410,13 @@ const cooldowns = new Map();
 function isOnCooldown(tiktokId) { return Date.now() - (cooldowns.get(tiktokId) || 0) < COOLDOWN_MS; }
 function setCooldown(tiktokId)  { cooldowns.set(tiktokId, Date.now()); }
 
-// ── TikTok connection ───────────────────────────────────────────────────────
+// ── TikTok connections ──────────────────────────────────────────────────────
+// Supports more than one live at the same time.
+// Example env:
+//   TIKTOK_USERNAME=fsblaker
+//   TIKTOK_USERNAME_2=barbariandino
+// or:
+//   EXTRA_TIKTOK_USERNAMES=barbariandino,anotherstreamer
 
 function buildTikTokOptions() {
   return {
@@ -399,67 +427,129 @@ function buildTikTokOptions() {
   };
 }
 
-let tiktok         = new WebcastPushConnection(TIKTOK_USERNAME, buildTikTokOptions());
-let retryDelay     = 15_000;
-let reconnectTimer = null;
-let connecting     = false;
+const streams = new Map();
 
-/** Re-create the TikTok connection object when username changes. */
-function rebuildTikTokConnection() {
-  // Re-register event handlers on the new instance
-  tiktok = new WebcastPushConnection(TIKTOK_USERNAME, buildTikTokOptions());
-  registerTikTokEvents();
-  info(`[sync] TikTok connection rebuilt for @${TIKTOK_USERNAME}`);
+function updateAggregateBotState() {
+  const list = [...streams.values()];
+  botConnected = list.some(s => s.connected);
+  currentViewers = list.reduce((sum, s) => sum + Number(s.currentViewers || 0), 0);
+  const roomIds = list.filter(s => s.currentRoomId).map(s => `${s.username}:${s.currentRoomId}`);
+  currentRoomId = roomIds.length ? roomIds.join(', ') : null;
 }
 
-function scheduleReconnect(delayMs) {
-  if (reconnectTimer) clearTimeout(reconnectTimer);
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    connectTikTok();
+function ensureStream(username) {
+  username = normalizeTikTokUsername(username);
+  if (!username) return null;
+  if (streams.has(username)) return streams.get(username);
+
+  const conn = new WebcastPushConnection(username, buildTikTokOptions());
+  const entry = {
+    username,
+    conn,
+    retryDelay: 15_000,
+    reconnectTimer: null,
+    connecting: false,
+    connected: false,
+    currentViewers: 0,
+    currentRoomId: null,
+  };
+  streams.set(username, entry);
+  registerTikTokEvents(entry);
+  return entry;
+}
+
+function disconnectStream(username) {
+  const entry = streams.get(username);
+  if (!entry) return;
+  if (entry.reconnectTimer) clearTimeout(entry.reconnectTimer);
+  try { entry.conn.disconnect(); } catch (_) {}
+  streams.delete(username);
+  updateAggregateBotState();
+}
+
+function rebuildTikTokConnections() {
+  const wanted = new Set(getStreamUsers());
+
+  for (const username of [...streams.keys()]) {
+    if (!wanted.has(username)) {
+      warn(`[sync] Removing TikTok connection @${username}`);
+      disconnectStream(username);
+    }
+  }
+
+  for (const username of wanted) {
+    if (!streams.has(username)) {
+      info(`[sync] Adding TikTok connection @${username}`);
+      ensureStream(username);
+    }
+  }
+
+  updateAggregateBotState();
+}
+
+function scheduleReconnect(username, delayMs) {
+  const entry = ensureStream(username);
+  if (!entry) return;
+  if (entry.reconnectTimer) clearTimeout(entry.reconnectTimer);
+  entry.reconnectTimer = setTimeout(() => {
+    entry.reconnectTimer = null;
+    connectTikTok(username);
   }, delayMs);
 }
 
-function connectTikTok() {
-  if (connecting) return;
-  connecting = true;
-  info(`Connecting to @${TIKTOK_USERNAME}…`);
-  postBotStatusToServer({ connecting: true, connected: false });
+function connectTikTok(username) {
+  const entry = ensureStream(username);
+  if (!entry || entry.connecting) return;
 
-  tiktok.connect()
+  entry.connecting = true;
+  info(`Connecting to @${entry.username}…`);
+  updateAggregateBotState();
+  postBotStatusToServer({ connecting: true, connected: botConnected });
+
+  entry.conn.connect()
     .then(state => {
-      connecting     = false;
-      retryDelay     = 15_000;
-      botConnected   = true;
-      currentRoomId  = state?.roomId ? String(state.roomId) : null;
-      ok(`Connected to TikTok Live @${TIKTOK_USERNAME}`);
-      if (state?.roomId) info(`Room ID: ${state.roomId}`);
-      postBotStatusToServer({ connected: true, connecting: false, roomId: currentRoomId });
+      entry.connecting = false;
+      entry.retryDelay = 15_000;
+      entry.connected = true;
+      entry.currentRoomId = state?.roomId ? String(state.roomId) : null;
+      ok(`Connected to TikTok Live @${entry.username}`);
+      if (state?.roomId) info(`@${entry.username} Room ID: ${state.roomId}`);
+      updateAggregateBotState();
+      postBotStatusToServer({ connected: botConnected, connecting: false, roomId: currentRoomId });
     })
     .catch(e => {
-      connecting   = false;
-      botConnected = false;
-      const hint   = e?.exception?.retryAfter ?? e?.retryAfter;
-      const delay  = hint ? hint * 1_000 : retryDelay;
-      retryDelay   = Math.min(retryDelay * 2, MAX_RETRY_MS);
-      err(`TikTok connect failed: ${e.message || e}`);
-      if (!SESSION_ID) {
-        warn('Tip: set TIKTOK_SESSION_ID env var to your TikTok sessionid cookie.');
-      }
-      info(`Retrying in ${delay / 1000}s…`);
-      postBotStatusToServer({ connected: false, connecting: false, error: String(e.message || e) });
-      scheduleReconnect(delay);
+      entry.connecting = false;
+      entry.connected = false;
+      const hint = e?.exception?.retryAfter ?? e?.retryAfter;
+      const delay = hint ? hint * 1_000 : entry.retryDelay;
+      entry.retryDelay = Math.min(entry.retryDelay * 2, MAX_RETRY_MS);
+      updateAggregateBotState();
+      err(`TikTok connect failed for @${entry.username}: ${e.message || e}`);
+      if (!SESSION_ID) warn('Tip: set TIKTOK_SESSION_ID env var to your TikTok sessionid cookie.');
+      info(`Retrying @${entry.username} in ${delay / 1000}s…`);
+      postBotStatusToServer({ connected: botConnected, connecting: false, error: `@${entry.username}: ${String(e.message || e)}` });
+      scheduleReconnect(entry.username, delay);
     });
 }
 
+function connectAllTikTok() {
+  rebuildTikTokConnections();
+  for (const username of getStreamUsers()) connectTikTok(username);
+}
+
 // tiktok-live-connector is read-only; this logs what the bot would say.
-function respond(tiktokId, message) { log('CHAT ←', C.cyan, `@${tiktokId}: ${message}`); }
+function respond(tiktokId, message, sourceUsername = '') {
+  log('CHAT ←', C.cyan, `${sourceUsername ? '[' + sourceUsername + '] ' : ''}@${tiktokId}: ${message}`);
+}
 
 // ── Chat handler ────────────────────────────────────────────────────────────
 
-function registerTikTokEvents() {
+function registerTikTokEvents(entry) {
+  const tiktok = entry.conn;
+  const sourceUsername = entry.username;
+
   tiktok.on('chat', async (data) => {
-    const tiktokId = String(data.uniqueId || '').toLowerCase();
+    const tiktokId = normalizeTikTokUsername(data.uniqueId || '');
     const display  = data.nickname || data.uniqueId || tiktokId;
     const msg      = String(data.comment || '').trim();
     const lower    = msg.toLowerCase();
@@ -468,61 +558,61 @@ function registerTikTokEvents() {
     if (!isCmd) return;
 
     if (BANNED_TIKTOK_USERS.has(tiktokId)) {
-      cmd(`[blocked] @${display} tried command: ${msg}`);
+      cmd(`[${sourceUsername}] [blocked] @${display} tried command: ${msg}`);
       return;
     }
 
     if (lower !== '!help' && isOnCooldown(tiktokId)) {
-      cmd(`[cooldown] @${tiktokId} — ignored (${COOLDOWN_MS / 1000}s cooldown)`);
+      cmd(`[${sourceUsername}] [cooldown] @${tiktokId} — ignored (${COOLDOWN_MS / 1000}s cooldown)`);
       return;
     }
     setCooldown(tiktokId);
 
     if (lower === '!help') {
-      respond(tiktokId, '!q <name> = join queue | !q = rejoin | !p = position | !c = clear saved name');
-      cmd(`[!help] @${display}`);
+      respond(tiktokId, '!q <name> = join queue | !q = rejoin | !p = position | !c = clear saved name', sourceUsername);
+      cmd(`[${sourceUsername}] [!help] @${display}`);
       return;
     }
 
     if (lower === '!c') {
       const record = getRecord(users, tiktokId);
       if (!record.name) {
-        respond(tiktokId, 'You have no saved name to clear.');
-        cmd(`[!c] @${display} — no saved name`);
+        respond(tiktokId, 'You have no saved name to clear.', sourceUsername);
+        cmd(`[${sourceUsername}] [!c] @${display} — no saved name`);
         return;
       }
       if (ownNameIsActive(record)) {
-        respond(tiktokId, `${record.name} is still active in queue/playing. Ask the host to remove you first.`);
-        cmd(`[!c] @${display} blocked clear while active as ${record.name}`);
+        respond(tiktokId, `${record.name} is still active in queue/playing. Ask the host to remove you first.`, sourceUsername);
+        cmd(`[${sourceUsername}] [!c] @${display} blocked clear while active as ${record.name}`);
         return;
       }
       const old = record.name;
       setRecord(users, tiktokId, { name: '', queued: false });
-      respond(tiktokId, `Cleared saved name "${old}". Use !q <name> to set a new one.`);
-      cmd(`[!c] @${display} cleared "${old}"`);
+      respond(tiktokId, `Cleared saved name "${old}". Use !q <name> to set a new one.`, sourceUsername);
+      cmd(`[${sourceUsername}] [!c] @${display} cleared "${old}"`);
       return;
     }
 
     if (lower === '!p' || lower === '!queue') {
       const record = getRecord(users, tiktokId);
       if (!record.name) {
-        respond(tiktokId, 'No saved name. Use !q <YourName> to join the queue.');
-        cmd(`[!p] @${display} — no saved name`);
+        respond(tiktokId, 'No saved name. Use !q <YourName> to join the queue.', sourceUsername);
+        cmd(`[${sourceUsername}] [!p] @${display} — no saved name`);
         return;
       }
       if (isPlaying(record.name)) {
-        respond(tiktokId, `${record.name} is currently playing!`);
-        cmd(`[!p] @${display} (${record.name}) → PLAYING`);
+        respond(tiktokId, `${record.name} is currently playing!`, sourceUsername);
+        cmd(`[${sourceUsername}] [!p] @${display} (${record.name}) → PLAYING`);
         return;
       }
       const pos = getPosition(record.name);
       if (pos !== null) {
-        respond(tiktokId, `${record.name} is #${pos} of ${liveQueue.length} in the queue.`);
-        cmd(`[!p] @${display} (${record.name}) → #${pos}/${liveQueue.length}`);
+        respond(tiktokId, `${record.name} is #${pos} of ${liveQueue.length} in the queue.`, sourceUsername);
+        cmd(`[${sourceUsername}] [!p] @${display} (${record.name}) → #${pos}/${liveQueue.length}`);
       } else {
         if (record.queued) setRecord(users, tiktokId, { name: record.name, queued: false });
-        respond(tiktokId, `${record.name} is not in the queue. Type !q to rejoin.`);
-        cmd(`[!p] @${display} (${record.name}) → not in queue`);
+        respond(tiktokId, `${record.name} is not in the queue. Type !q to rejoin.`, sourceUsername);
+        cmd(`[${sourceUsername}] [!p] @${display} (${record.name}) → not in queue`);
       }
       return;
     }
@@ -537,45 +627,45 @@ function registerTikTokEvents() {
     if (ownNameIsActive(record)) {
       const pos    = getPosition(record.name);
       const status = isPlaying(record.name) ? 'currently playing' : `already in queue${pos ? ` at #${pos}` : ''}`;
-      respond(tiktokId, `${record.name} is ${status}. You cannot add another name.`);
-      cmd(`[!q] @${display} blocked duplicate while active as ${record.name}`);
+      respond(tiktokId, `${record.name} is ${status}. You cannot add another name.`, sourceUsername);
+      cmd(`[${sourceUsername}] [!q] @${display} blocked duplicate while active as ${record.name}`);
       return;
     }
 
     if (afterCommand) {
       const valid = validateName(afterCommand);
       if (!valid.ok) {
-        respond(tiktokId, valid.reason);
-        cmd(`[!q] @${display} invalid name: "${afterCommand}" (${valid.reason})`);
+        respond(tiktokId, valid.reason, sourceUsername);
+        cmd(`[${sourceUsername}] [!q] @${display} invalid name: "${afterCommand}" (${valid.reason})`);
         return;
       }
       const clean = valid.name;
       if (isNameTakenByOther(clean, tiktokId)) {
-        respond(tiktokId, `"${clean}" is already active. Try a different name.`);
-        cmd(`[!q] @${display} ✗ name "${clean}" taken by another user`);
+        respond(tiktokId, `"${clean}" is already active. Try a different name.`, sourceUsername);
+        cmd(`[${sourceUsername}] [!q] @${display} ✗ name "${clean}" taken by another user`);
         return;
       }
       setRecord(users, tiktokId, { name: clean, queued: false });
-      cmd(`[!q] @${display} saved name: ${clean}`);
+      cmd(`[${sourceUsername}] [!q] @${display} saved name: ${clean}`);
       const result = await addToQueue(clean);
       if (result === 'added' || result === 'already') {
         await refreshLiveQueueFromServer();
         setRecord(users, tiktokId, { name: clean, queued: true });
         const pos = getPosition(clean) || '?';
-        respond(tiktokId, result === 'added' ? `${clean} added to queue! Position: #${pos}` : `${clean} is already in the queue.`);
-        ok(`[!q] @${display} → ${clean} ${result} (#${pos})`);
+        respond(tiktokId, result === 'added' ? `${clean} added to queue! Position: #${pos}` : `${clean} is already in the queue.`, sourceUsername);
+        ok(`[${sourceUsername}] [!q] @${display} → ${clean} ${result} (#${pos})`);
       } else {
         setRecord(users, tiktokId, { name: clean, queued: false });
-        respond(tiktokId, `Could not add "${clean}" to the queue. Try again shortly.`);
-        err(`[!q] @${display} → could not add ${clean}`);
+        respond(tiktokId, `Could not add "${clean}" to the queue. Try again shortly.`, sourceUsername);
+        err(`[${sourceUsername}] [!q] @${display} → could not add ${clean}`);
       }
       return;
     }
 
     if (record.name) {
       if (isNameTakenByOther(record.name, tiktokId)) {
-        respond(tiktokId, `"${record.name}" is taken. Use !c to clear your name after the host removes the old slot.`);
-        cmd(`[!q] @${display} ✗ saved name "${record.name}" taken by another`);
+        respond(tiktokId, `"${record.name}" is taken. Use !c to clear your name after the host removes the old slot.`, sourceUsername);
+        cmd(`[${sourceUsername}] [!q] @${display} ✗ saved name "${record.name}" taken by another`);
         return;
       }
       const result = await addToQueue(record.name);
@@ -583,49 +673,53 @@ function registerTikTokEvents() {
         await refreshLiveQueueFromServer();
         setRecord(users, tiktokId, { name: record.name, queued: true });
         const pos = getPosition(record.name) || '?';
-        respond(tiktokId, result === 'added' ? `${record.name} rejoined the queue at #${pos}!` : `${record.name} is already in the queue.`);
-        ok(`[!q] @${display} → ${record.name} ${result} (#${pos})`);
+        respond(tiktokId, result === 'added' ? `${record.name} rejoined the queue at #${pos}!` : `${record.name} is already in the queue.`, sourceUsername);
+        ok(`[${sourceUsername}] [!q] @${display} → ${record.name} ${result} (#${pos})`);
       } else {
-        respond(tiktokId, `Could not rejoin queue as "${record.name}". Try again shortly.`);
-        err(`[!q] @${display} → could not add ${record.name}`);
+        respond(tiktokId, `Could not rejoin queue as "${record.name}". Try again shortly.`, sourceUsername);
+        err(`[${sourceUsername}] [!q] @${display} → could not add ${record.name}`);
       }
       return;
     }
 
-    respond(tiktokId, 'No saved name! Type !q <YourUbisoftName> to join the queue.');
-    cmd(`[!q] @${display} — no saved name`);
+    respond(tiktokId, 'No saved name! Type !q <YourUbisoftName> to join the queue.', sourceUsername);
+    cmd(`[${sourceUsername}] [!q] @${display} — no saved name`);
   });
 
   tiktok.on('disconnected', () => {
-    botConnected = false;
-    warn('TikTok disconnected — reconnecting in 15 seconds…');
-    retryDelay = 15_000;
-    postBotStatusToServer({ connected: false, connecting: false });
-    scheduleReconnect(15_000);
+    entry.connected = false;
+    entry.connecting = false;
+    updateAggregateBotState();
+    warn(`TikTok disconnected @${sourceUsername} — reconnecting in 15 seconds…`);
+    entry.retryDelay = 15_000;
+    postBotStatusToServer({ connected: botConnected, connecting: false, error: `@${sourceUsername} disconnected` });
+    scheduleReconnect(sourceUsername, 15_000);
   });
 
   tiktok.on('error', e => {
-    err('TikTok stream error:', e.message || JSON.stringify(e));
-    postBotStatusToServer({ connected: botConnected, error: String(e.message || e) });
+    err(`TikTok stream error @${sourceUsername}:`, e.message || JSON.stringify(e));
+    postBotStatusToServer({ connected: botConnected, error: `@${sourceUsername}: ${String(e.message || e)}` });
   });
 
   tiktok.on('roomUser', d => {
     if (d?.viewerCount != null) {
-      currentViewers = Number(d.viewerCount);
-      info(`Viewers: ${currentViewers}`);
+      entry.currentViewers = Number(d.viewerCount);
+      updateAggregateBotState();
+      info(`@${sourceUsername} Viewers: ${entry.currentViewers}`);
       postBotStatusToServer({ viewers: currentViewers });
     }
   });
 }
 
-// Register events on the initial instance
-registerTikTokEvents();
+// Build initial stream objects.
+rebuildTikTokConnections();
 
 // ── Graceful shutdown ───────────────────────────────────────────────────────
 
 function shutdown(signal) {
   warn(`\nReceived ${signal} — saving state and exiting…`);
   saveUsers(users);
+  for (const entry of streams.values()) { try { entry.conn.disconnect(); } catch (_) {} }
   postBotStatusToServer({ connected: false, connecting: false, error: `Shutdown: ${signal}` })
     .finally(() => process.exit(0));
 }
@@ -652,7 +746,7 @@ setInterval(fetchBotConfigFromServer, 60_000);
 setInterval(() => {
   const knownUsers    = Object.keys(users).length;
   const queued        = Object.values(users).filter(r => r?.queued).length;
-  info(`Stats — known users: ${knownUsers}, queued records: ${queued}, live queue: ${liveQueue.length}, playing: ${livePlaying.length}, viewers: ${currentViewers}`);
+  info(`Stats — streams: ${getStreamUsers().map(u => '@' + u).join(', ')}, known users: ${knownUsers}, queued records: ${queued}, live queue: ${liveQueue.length}, playing: ${livePlaying.length}, viewers: ${currentViewers}`);
 }, 5 * 60_000);
 
 // ── Start ───────────────────────────────────────────────────────────────────
@@ -663,9 +757,9 @@ printBanner();
 fetchBotConfigFromServer()
   .then(() => {
     ok('[sync] Config loaded from server — starting TikTok connection');
-    connectTikTok();
+    connectAllTikTok();
   })
   .catch(() => {
     warn('[sync] Could not fetch server config (server may be down) — using env defaults');
-    connectTikTok();
+    connectAllTikTok();
   });
