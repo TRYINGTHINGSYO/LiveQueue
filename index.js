@@ -333,7 +333,9 @@ function setCooldown(tiktokId) { cooldowns.set(tiktokId, Date.now()); }
 // ── TikTok connection ───────────────────────────────────────────────────────
 
 const tiktokOptions = {
-  enableExtendedGiftInfo: true,
+  // TikTok is currently returning 403 on the gift list endpoint for many bots.
+  // Keep this OFF because this queue bot only needs chat commands like !q, not gift metadata.
+  enableExtendedGiftInfo: false,
   enableWebsocketUpgrade: true,
   requestPollingIntervalMs: 2_000,
   ...(SESSION_ID ? { sessionId: SESSION_ID } : {}),
