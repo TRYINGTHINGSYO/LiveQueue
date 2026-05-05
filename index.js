@@ -161,20 +161,34 @@ function saveUsers(users) {
   catch (e) { err('Could not save users.json:', e.message); }
 }
 
-function getRecord(users, tiktokId) {
+function getRecord(users, userKey) {
   const r = users[tiktokId];
   if (!r) return { name: '', queued: false };
   if (typeof r === 'string') return { name: r, queued: false };
   return { name: r.name || '', queued: Boolean(r.queued) };
 }
 
-function setRecord(users, tiktokId, record) {
+function setRecord(users, userKey, record) {
   users[tiktokId] = { name: record.name || '', queued: Boolean(record.queued) };
   saveUsers(users);
   // Keep the admin panel's TikTok Saved Names list current after !q, !c, or !r.
   setTimeout(() => {
     try { postBotStatusToServer().catch(() => {}); } catch (_) {}
   }, 0);
+}
+
+// Use a different saved-name/lock key for each stream.
+// This fixes the problem where @fsblaker joining @barbariandino's live
+// gets blocked because @fsblaker already has a saved/queued record on his own live.
+function streamUserKey(sourceUsername, tiktokId) {
+  const stream = normalizeTikTokUsername(sourceUsername || 'main');
+  const user = normalizeTikTokUsername(tiktokId || 'unknown');
+  return `${stream}:${user}`;
+}
+
+function displayUserKey(key) {
+  const parts = String(key || '').split(':');
+  return parts.length > 1 ? parts.slice(1).join(':') : String(key || '');
 }
 
 // ── Name sanitiser and filters ──────────────────────────────────────────────
@@ -437,8 +451,8 @@ function getSavedUsersForAdmin() {
 
       return {
         tiktok,
-        tiktokUsername: tiktok,
-        username: tiktok,
+        tiktokUsername: displayUserKey(tiktok),
+        username: displayUserKey(tiktok),
         ubisoft: name,
         ubisoftName: name,
         name,
@@ -572,7 +586,7 @@ async function pollQueue() {
 
   let changed = false;
   for (const [tiktokId, raw] of Object.entries(users)) {
-    const record = getRecord(users, tiktokId);
+    const record = getRecord(users, userKey);
     if (record.queued && record.name && !activeNames.has(record.name.toLowerCase())) {
       warn(`↩  @${tiktokId} (${record.name}) removed from queue/playing — unlocked for rejoin`);
       users[tiktokId] = { name: record.name, queued: false };
@@ -591,8 +605,8 @@ pollQueue();
 // ── Per-user cooldown (anti-spam) ───────────────────────────────────────────
 
 const cooldowns = new Map();
-function isOnCooldown(tiktokId) { return Date.now() - (cooldowns.get(tiktokId) || 0) < COOLDOWN_MS; }
-function setCooldown(tiktokId)  { cooldowns.set(tiktokId, Date.now()); }
+function isOnCooldown(key) { return Date.now() - (cooldowns.get(key) || 0) < COOLDOWN_MS; }
+function setCooldown(key)  { cooldowns.set(key, Date.now()); }
 
 // ── TikTok connections ──────────────────────────────────────────────────────
 // Supports more than one live at the same time.
@@ -791,13 +805,17 @@ function registerTikTokEvents(entry) {
   // others emit them as `comment`. Register BOTH for every stream so the
   // second live, like @barbariandino, can also use !q / !c / !r.
   const handleChatCommand = async (data, eventName = 'chat') => {
-    const tiktokId = normalizeTikTokUsername(data?.uniqueId || data?.user?.uniqueId || data?.userId || data?.user?.id || '');
-    const display  = data?.nickname || data?.user?.nickname || data?.uniqueId || tiktokId;
+    const rawTikTokId = normalizeTikTokUsername(data?.uniqueId || data?.user?.uniqueId || data?.userId || data?.user?.id || '');
+    const tiktokId = rawTikTokId;
+    const userKey = streamUserKey(sourceUsername, rawTikTokId);
+    const display  = data?.nickname || data?.user?.nickname || data?.uniqueId || rawTikTokId;
     const msg      = String(data?.comment || data?.text || data?.content || data?.msg || '').trim();
     const lower    = msg.toLowerCase();
 
     const isCmd = lower === '!c' || lower === '!clear' || lower === '!r' || lower === '!reset' || lower === '!p' || lower === '!help' || lower === '!queue' || lower.startsWith('!q');
     if (!isCmd) return;
+
+    cmd(`[${sourceUsername}] command heard from @${display} / key=${userKey}: ${msg}`);
 
     // Prevent duplicate handling if a connector emits both `chat` and `comment`
     // for the same message. Keeps one person from being queued twice.
@@ -805,7 +823,7 @@ function registerTikTokEvents(entry) {
     for (const [key, t] of recentCommands) {
       if (now - t > 2500) recentCommands.delete(key);
     }
-    const dedupeKey = `${tiktokId}|${lower}`;
+    const dedupeKey = `${sourceUsername}|${rawTikTokId}|${lower}`;
     if (recentCommands.has(dedupeKey)) return;
     recentCommands.set(dedupeKey, now);
 
@@ -814,11 +832,11 @@ function registerTikTokEvents(entry) {
       return;
     }
 
-    if (lower !== '!help' && isOnCooldown(tiktokId)) {
+    if (lower !== '!help' && isOnCooldown(userKey)) {
       cmd(`[${sourceUsername}] [cooldown] @${tiktokId} — ignored (${COOLDOWN_MS / 1000}s cooldown)`);
       return;
     }
-    setCooldown(tiktokId);
+    setCooldown(userKey);
 
     if (lower === '!help') {
       respond(tiktokId, '!q <name> = save name + join | !q = rejoin saved name | !p = position | !c = clear from queue | !r = reset saved name', sourceUsername);
@@ -827,7 +845,7 @@ function registerTikTokEvents(entry) {
     }
 
     if (lower === '!c' || lower === '!clear') {
-      const record = getRecord(users, tiktokId);
+      const record = getRecord(users, userKey);
       if (!record.name) {
         respond(tiktokId, 'You have no saved name. Use !q <YourName> to join the queue.', sourceUsername);
         cmd(`[${sourceUsername}] [!c] @${display} — no saved name`);
@@ -843,7 +861,7 @@ function registerTikTokEvents(entry) {
       }
 
       if (!isInQueue(record.name)) {
-        setRecord(users, tiktokId, { name: record.name, queued: false });
+        setRecord(users, userKey, { name: record.name, queued: false });
         respond(tiktokId, `${record.name} is not in the queue. Your saved name is still set. Use !q to rejoin or !r to reset it.`, sourceUsername);
         cmd(`[${sourceUsername}] [!c] @${display} (${record.name}) — not in queue`);
         return;
@@ -851,11 +869,11 @@ function registerTikTokEvents(entry) {
 
       const result = await removeFromQueue(record.name);
       if (result === 'removed') {
-        setRecord(users, tiktokId, { name: record.name, queued: false });
+        setRecord(users, userKey, { name: record.name, queued: false });
         respond(tiktokId, `${record.name} cleared from the queue. Saved name kept. Type !q to rejoin or !r to reset your name.`, sourceUsername);
         ok(`[${sourceUsername}] [!c] @${display} removed ${record.name} from queue`);
       } else if (result === 'not_found') {
-        setRecord(users, tiktokId, { name: record.name, queued: false });
+        setRecord(users, userKey, { name: record.name, queued: false });
         respond(tiktokId, `${record.name} was not detected in the queue, so there was nothing to clear. Saved name kept.`, sourceUsername);
         cmd(`[${sourceUsername}] [!c] @${display} ${record.name} not detected in queue`);
       } else {
@@ -866,7 +884,7 @@ function registerTikTokEvents(entry) {
     }
 
     if (lower === '!r' || lower === '!reset') {
-      const record = getRecord(users, tiktokId);
+      const record = getRecord(users, userKey);
       if (!record.name) {
         respond(tiktokId, 'You have no saved name to reset. Use !q <YourName> to set one.', sourceUsername);
         cmd(`[${sourceUsername}] [!r] @${display} — no saved name`);
@@ -888,14 +906,14 @@ function registerTikTokEvents(entry) {
       }
 
       const old = record.name;
-      setRecord(users, tiktokId, { name: '', queued: false });
+      setRecord(users, userKey, { name: '', queued: false });
       respond(tiktokId, `Reset saved name "${old}". Use !q <NewUbisoftName> to set a new one.`, sourceUsername);
       cmd(`[${sourceUsername}] [!r] @${display} reset "${old}"`);
       return;
     }
 
     if (lower === '!p' || lower === '!queue') {
-      const record = getRecord(users, tiktokId);
+      const record = getRecord(users, userKey);
       if (!record.name) {
         respond(tiktokId, 'No saved name. Use !q <YourName> to join the queue.', sourceUsername);
         cmd(`[${sourceUsername}] [!p] @${display} — no saved name`);
@@ -911,7 +929,7 @@ function registerTikTokEvents(entry) {
         respond(tiktokId, `${record.name} is #${pos} of ${liveQueue.length} in the queue.`, sourceUsername);
         cmd(`[${sourceUsername}] [!p] @${display} (${record.name}) → #${pos}/${liveQueue.length}`);
       } else {
-        if (record.queued) setRecord(users, tiktokId, { name: record.name, queued: false });
+        if (record.queued) setRecord(users, userKey, { name: record.name, queued: false });
         respond(tiktokId, `${record.name} is not in the queue. Type !q to rejoin.`, sourceUsername);
         cmd(`[${sourceUsername}] [!p] @${display} (${record.name}) → not in queue`);
       }
@@ -921,7 +939,7 @@ function registerTikTokEvents(entry) {
     if (!lower.startsWith('!q')) return;
 
     const afterCommand = msg.replace(/^!q(?:ueue)?/i, '').trim();
-    const record       = getRecord(users, tiktokId);
+    const record       = getRecord(users, userKey);
 
     await refreshLiveQueueFromServer();
 
@@ -951,22 +969,22 @@ function registerTikTokEvents(entry) {
         return;
       }
 
-      if (isNameTakenByOther(clean, tiktokId)) {
+      if (isNameTakenByOther(clean, userKey)) {
         respond(tiktokId, `"${clean}" is already active. Try a different name.`, sourceUsername);
         cmd(`[${sourceUsername}] [!q] @${display} ✗ name "${clean}" taken by another user`);
         return;
       }
-      setRecord(users, tiktokId, { name: clean, queued: false });
+      setRecord(users, userKey, { name: clean, queued: false });
       cmd(`[${sourceUsername}] [!q] @${display} saved name: ${clean}`);
       const result = await addToQueue(clean);
       if (result === 'added' || result === 'already') {
         await refreshLiveQueueFromServer();
-        setRecord(users, tiktokId, { name: clean, queued: true });
+        setRecord(users, userKey, { name: clean, queued: true });
         const pos = getPosition(clean) || '?';
         respond(tiktokId, result === 'added' ? `${clean} added to queue! Position: #${pos}` : `${clean} is already in the queue.`, sourceUsername);
         ok(`[${sourceUsername}] [!q] @${display} → ${clean} ${result} (#${pos})`);
       } else {
-        setRecord(users, tiktokId, { name: clean, queued: false });
+        setRecord(users, userKey, { name: clean, queued: false });
         respond(tiktokId, `Could not add "${clean}" to the queue. Try again shortly.`, sourceUsername);
         err(`[${sourceUsername}] [!q] @${display} → could not add ${clean}`);
       }
@@ -974,7 +992,7 @@ function registerTikTokEvents(entry) {
     }
 
     if (record.name) {
-      if (isNameTakenByOther(record.name, tiktokId)) {
+      if (isNameTakenByOther(record.name, userKey)) {
         respond(tiktokId, `"${record.name}" is taken. Use !r to reset your saved name after the host removes the old slot.`, sourceUsername);
         cmd(`[${sourceUsername}] [!q] @${display} ✗ saved name "${record.name}" taken by another`);
         return;
@@ -982,7 +1000,7 @@ function registerTikTokEvents(entry) {
       const result = await addToQueue(record.name);
       if (result === 'added' || result === 'already') {
         await refreshLiveQueueFromServer();
-        setRecord(users, tiktokId, { name: record.name, queued: true });
+        setRecord(users, userKey, { name: record.name, queued: true });
         const pos = getPosition(record.name) || '?';
         respond(tiktokId, result === 'added' ? `${record.name} rejoined the queue at #${pos}!` : `${record.name} is already in the queue.`, sourceUsername);
         ok(`[${sourceUsername}] [!q] @${display} → ${record.name} ${result} (#${pos})`);
