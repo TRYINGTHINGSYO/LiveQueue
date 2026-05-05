@@ -622,24 +622,37 @@ function updateAggregateBotState() {
   currentRoomId = roomIds.length ? roomIds.join(', ') : null;
 }
 
+function createFreshTikTokConnection(entry) {
+  // Important: tiktok-live-connector can get stuck after a failed/offline connect.
+  // Make a brand-new connection object every time we retry, so one offline stream
+  // never blocks the other stream and nobody has to redeploy when going live later.
+  try {
+    if (entry.conn) entry.conn.disconnect();
+  } catch (_) {}
+
+  entry.conn = new WebcastPushConnection(entry.username, buildTikTokOptions(entry.username));
+  registerTikTokEvents(entry);
+  return entry.conn;
+}
+
 function ensureStream(username) {
   username = normalizeTikTokUsername(username);
   if (!username) return null;
   if (streams.has(username)) return streams.get(username);
 
-  const conn = new WebcastPushConnection(username, buildTikTokOptions(username));
   const entry = {
     username,
-    conn,
+    conn: null,
     retryDelay: 15_000,
     reconnectTimer: null,
     connecting: false,
     connected: false,
     currentViewers: 0,
     currentRoomId: null,
+    lastConnectAttempt: 0,
   };
   streams.set(username, entry);
-  registerTikTokEvents(entry);
+  createFreshTikTokConnection(entry);
   return entry;
 }
 
@@ -647,7 +660,10 @@ function disconnectStream(username) {
   const entry = streams.get(username);
   if (!entry) return;
   if (entry.reconnectTimer) clearTimeout(entry.reconnectTimer);
-  try { entry.conn.disconnect(); } catch (_) {}
+  entry.reconnectTimer = null;
+  entry.connecting = false;
+  entry.connected = false;
+  try { if (entry.conn) entry.conn.disconnect(); } catch (_) {}
   streams.delete(username);
   updateAggregateBotState();
 }
@@ -677,11 +693,12 @@ function scheduleReconnect(username, delayMs) {
   if (!getStreamUsers().includes(username)) return;
   const entry = ensureStream(username);
   if (!entry) return;
+  const safeDelay = Math.max(5_000, Number(delayMs || 15_000));
   if (entry.reconnectTimer) clearTimeout(entry.reconnectTimer);
   entry.reconnectTimer = setTimeout(() => {
     entry.reconnectTimer = null;
     connectTikTok(username);
-  }, delayMs);
+  }, safeDelay);
 }
 
 function connectTikTok(username) {
@@ -691,6 +708,9 @@ function connectTikTok(username) {
   if (!entry || entry.connecting || entry.connected) return;
 
   entry.connecting = true;
+  entry.lastConnectAttempt = Date.now();
+  createFreshTikTokConnection(entry);
+
   info(`Connecting to @${entry.username}…`);
   updateAggregateBotState();
   postBotStatusToServer({ connecting: true, connected: botConnected });
@@ -709,14 +729,17 @@ function connectTikTok(username) {
     .catch(e => {
       entry.connecting = false;
       entry.connected = false;
+      entry.currentRoomId = null;
       const hint = e?.exception?.retryAfter ?? e?.retryAfter;
       const delay = hint ? hint * 1_000 : entry.retryDelay;
       entry.retryDelay = Math.min(entry.retryDelay * 2, MAX_RETRY_MS);
       updateAggregateBotState();
-      err(`TikTok connect failed for @${entry.username}: ${e.message || e}`);
+
+      const message = String(e?.message || e || 'unknown error');
+      err(`TikTok connect failed for @${entry.username}: ${message}`);
       if (!getSessionIdForUsername(entry.username)) warn(`Tip: set a sessionid for @${entry.username}. Use TIKTOK_SESSION_ID for primary, TIKTOK_SESSION_ID_2 for the second stream, or TIKTOK_SESSION_IDS=username=sessionid.`);
-      info(`Retrying @${entry.username} in ${delay / 1000}s…`);
-      postBotStatusToServer({ connected: botConnected, connecting: false, error: `@${entry.username}: ${String(e.message || e)}` });
+      info(`Keeping @${entry.username} armed. Retrying in ${Math.round(delay / 1000)}s so you do NOT have to redeploy when that live starts.`);
+      postBotStatusToServer({ connected: botConnected, connecting: false, error: `@${entry.username}: ${message}` });
       scheduleReconnect(entry.username, delay);
     });
 }
@@ -729,8 +752,28 @@ function connectAllTikTok() {
     postBotStatusToServer({ connected: false, connecting: false, error: 'No TikTok accounts enabled' });
     return;
   }
-  for (const username of activeUsers) connectTikTok(username);
+
+  // Stagger connection attempts slightly. This avoids TikTok rate-limit/weirdness
+  // where trying both rooms at the exact same millisecond can make one say it
+  // cannot reach the room even though the other works.
+  activeUsers.forEach((username, i) => {
+    setTimeout(() => connectTikTok(username), i * 5_000);
+  });
 }
+
+function keepTikTokConnectionsAlive() {
+  const activeUsers = getStreamUsers();
+  for (const username of activeUsers) {
+    const entry = ensureStream(username);
+    if (!entry) continue;
+    if (!entry.connected && !entry.connecting && !entry.reconnectTimer) {
+      info(`Watchdog: @${entry.username} is not connected — trying again now.`);
+      connectTikTok(entry.username);
+    }
+  }
+}
+
+setInterval(keepTikTokConnectionsAlive, 30_000);
 
 // tiktok-live-connector is read-only; this logs what the bot would say.
 function respond(tiktokId, message, sourceUsername = '') {
@@ -960,8 +1003,9 @@ function registerTikTokEvents(entry) {
   tiktok.on('disconnected', () => {
     entry.connected = false;
     entry.connecting = false;
+    entry.currentRoomId = null;
     updateAggregateBotState();
-    warn(`TikTok disconnected @${sourceUsername} — reconnecting in 15 seconds…`);
+    warn(`TikTok disconnected @${sourceUsername} — reconnecting in 15 seconds. No redeploy needed.`);
     entry.retryDelay = 15_000;
     postBotStatusToServer({ connected: botConnected, connecting: false, error: `@${sourceUsername} disconnected` });
     scheduleReconnect(sourceUsername, 15_000);
