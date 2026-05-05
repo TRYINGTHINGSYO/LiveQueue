@@ -704,15 +704,29 @@ function respond(tiktokId, message, sourceUsername = '') {
 function registerTikTokEvents(entry) {
   const tiktok = entry.conn;
   const sourceUsername = entry.username;
+  const recentCommands = new Map();
 
-  tiktok.on('chat', async (data) => {
-    const tiktokId = normalizeTikTokUsername(data.uniqueId || '');
-    const display  = data.nickname || data.uniqueId || tiktokId;
-    const msg      = String(data.comment || '').trim();
+  // Some TikTok Live connector versions/accounts emit comments as `chat`;
+  // others emit them as `comment`. Register BOTH for every stream so the
+  // second live, like @barbariandino, can also use !q / !c / !r.
+  const handleChatCommand = async (data, eventName = 'chat') => {
+    const tiktokId = normalizeTikTokUsername(data?.uniqueId || data?.user?.uniqueId || data?.userId || data?.user?.id || '');
+    const display  = data?.nickname || data?.user?.nickname || data?.uniqueId || tiktokId;
+    const msg      = String(data?.comment || data?.text || data?.content || data?.msg || '').trim();
     const lower    = msg.toLowerCase();
 
     const isCmd = lower === '!c' || lower === '!clear' || lower === '!r' || lower === '!reset' || lower === '!p' || lower === '!help' || lower === '!queue' || lower.startsWith('!q');
     if (!isCmd) return;
+
+    // Prevent duplicate handling if a connector emits both `chat` and `comment`
+    // for the same message. Keeps one person from being queued twice.
+    const now = Date.now();
+    for (const [key, t] of recentCommands) {
+      if (now - t > 2500) recentCommands.delete(key);
+    }
+    const dedupeKey = `${tiktokId}|${lower}`;
+    if (recentCommands.has(dedupeKey)) return;
+    recentCommands.set(dedupeKey, now);
 
     if (BANNED_TIKTOK_USERS.has(tiktokId)) {
       cmd(`[${sourceUsername}] [blocked] @${display} tried command: ${msg}`);
@@ -900,7 +914,10 @@ function registerTikTokEvents(entry) {
 
     respond(tiktokId, 'No saved name! Type !q <YourUbisoftName> to join the queue.', sourceUsername);
     cmd(`[${sourceUsername}] [!q] @${display} — no saved name`);
-  });
+  };
+
+  tiktok.on('chat', data => handleChatCommand(data, 'chat'));
+  tiktok.on('comment', data => handleChatCommand(data, 'comment'));
 
   tiktok.on('disconnected', () => {
     entry.connected = false;
