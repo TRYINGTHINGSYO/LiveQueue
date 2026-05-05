@@ -60,7 +60,44 @@ let TIKTOK_USERNAME_2_ENABLED = envBool(process.env.TIKTOK_USERNAME_2_ENABLED, E
 const BASE_URL       = (process.env.QUEUE_API_URL || 'https://siegequeue.com').replace(/\/api.*$/, '').replace(/\/$/, '');
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || process.env.ADMIN_SECRET || '';
 const SESSION_ID     = process.env.TIKTOK_SESSION_ID || '';
+const SESSION_ID_2   = process.env.TIKTOK_SESSION_ID_2 || '';
 const DATA_FILE      = process.env.USER_DATA_FILE || './users.json';
+
+function parseSessionIdMap(value) {
+  const out = new Map();
+  String(value || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean)
+    .forEach(pair => {
+      const eq = pair.indexOf('=');
+      if (eq === -1) return;
+      const user = normalizeTikTokUsername(pair.slice(0, eq));
+      const sid = pair.slice(eq + 1).trim();
+      if (user && sid) out.set(user, sid);
+    });
+  return out;
+}
+
+// Optional per-stream session IDs.
+// Examples:
+//   TIKTOK_SESSION_ID=your sessionid
+//   TIKTOK_SESSION_ID_2=her sessionid
+// or for many streams:
+//   TIKTOK_SESSION_IDS=barbariandino=herSession,anothername=theirSession
+const SESSION_IDS_BY_USER = parseSessionIdMap(process.env.TIKTOK_SESSION_IDS || '');
+
+function getSessionIdForUsername(username) {
+  const user = normalizeTikTokUsername(username);
+  if (SESSION_IDS_BY_USER.has(user)) return SESSION_IDS_BY_USER.get(user);
+  if (user && user === normalizeTikTokUsername(TIKTOK_USERNAME)) return SESSION_ID;
+
+  const extraIndex = EXTRA_TIKTOK_USERNAMES.findIndex(u => normalizeTikTokUsername(u) === user);
+  if (extraIndex === 0 && SESSION_ID_2) return SESSION_ID_2;
+
+  // Fallback: one sessionid can often read multiple public lives.
+  return SESSION_ID;
+}
 
 // These are mutable — overwritten when server config is fetched.
 let POLL_MS        = Number(process.env.POLL_MS      || 5_000);
@@ -103,7 +140,7 @@ ${C.cyan}${C.bold}╔═══════════════════�
   Extra : ${TIKTOK_USERNAME_2_ENABLED ? C.green + 'ON ' + C.reset : C.red + 'OFF' + C.reset} ${EXTRA_TIKTOK_USERNAMES.map(u => '@' + u).join(', ') || 'none'}
   API   : ${C.yellow}${BASE_URL}${C.reset}
   Auth  : ${ADMIN_PASSWORD ? `${C.green}✓ set${C.reset}` : `${C.red}✗ missing${C.reset}`}
-  Cookie: ${SESSION_ID ? `${C.green}✓ set${C.reset}` : `${C.yellow}⚠ not set (may fail if stream is private)${C.reset}`}
+  Cookie: ${SESSION_ID ? `${C.green}✓ primary set${C.reset}` : `${C.yellow}⚠ primary not set${C.reset}`} | Extra: ${SESSION_ID_2 || SESSION_IDS_BY_USER.size ? `${C.green}✓ set${C.reset}` : `${C.yellow}⚠ not set${C.reset}`}
   Sync  : ${C.green}Admin panel config sync ENABLED${C.reset}
 
   ${C.dim}Commands: !q <name>  •  !q  •  !p  •  !c  •  !r  •  !help${C.reset}
@@ -565,12 +602,13 @@ function setCooldown(tiktokId)  { cooldowns.set(tiktokId, Date.now()); }
 // or:
 //   EXTRA_TIKTOK_USERNAMES=barbariandino,anotherstreamer
 
-function buildTikTokOptions() {
+function buildTikTokOptions(username) {
+  const sessionId = getSessionIdForUsername(username);
   return {
     enableExtendedGiftInfo  : false,
     enableWebsocketUpgrade  : true,
     requestPollingIntervalMs: 2_000,
-    ...(SESSION_ID ? { sessionId: SESSION_ID } : {}),
+    ...(sessionId ? { sessionId } : {}),
   };
 }
 
@@ -589,7 +627,7 @@ function ensureStream(username) {
   if (!username) return null;
   if (streams.has(username)) return streams.get(username);
 
-  const conn = new WebcastPushConnection(username, buildTikTokOptions());
+  const conn = new WebcastPushConnection(username, buildTikTokOptions(username));
   const entry = {
     username,
     conn,
@@ -676,7 +714,7 @@ function connectTikTok(username) {
       entry.retryDelay = Math.min(entry.retryDelay * 2, MAX_RETRY_MS);
       updateAggregateBotState();
       err(`TikTok connect failed for @${entry.username}: ${e.message || e}`);
-      if (!SESSION_ID) warn('Tip: set TIKTOK_SESSION_ID env var to your TikTok sessionid cookie.');
+      if (!getSessionIdForUsername(entry.username)) warn(`Tip: set a sessionid for @${entry.username}. Use TIKTOK_SESSION_ID for primary, TIKTOK_SESSION_ID_2 for the second stream, or TIKTOK_SESSION_IDS=username=sessionid.`);
       info(`Retrying @${entry.username} in ${delay / 1000}s…`);
       postBotStatusToServer({ connected: botConnected, connecting: false, error: `@${entry.username}: ${String(e.message || e)}` });
       scheduleReconnect(entry.username, delay);
