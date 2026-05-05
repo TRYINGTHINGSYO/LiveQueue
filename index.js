@@ -370,6 +370,32 @@ function findQueuedPlayerByName(name) {
   return liveQueue.find(p => String(p.name || '').toLowerCase() === n) || null;
 }
 
+async function postPositionSpotlight(name, tiktokId = '') {
+  const clean = String(name || '').trim();
+  if (!clean) return false;
+  if (!ADMIN_PASSWORD) {
+    warn('ADMIN_PASSWORD not set — cannot update position overlay');
+    return false;
+  }
+
+  try {
+    const r = await fetchWithTimeout(`${BASE_URL}/api/admin/position-spotlight`, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({ name: clean, tiktok: displayUserKey(tiktokId) }),
+    }, 6_000);
+    if (!r.ok) {
+      const text = await r.text().catch(() => '');
+      warn(`position overlay update failed for ${clean}: ${r.status} ${text}`);
+      return false;
+    }
+    return true;
+  } catch (e) {
+    warn(`position overlay network error for ${clean}: ${e.message}`);
+    return false;
+  }
+}
+
 async function removeFromQueue(name) {
   const clean = String(name || '').trim();
   if (!clean) return 'not_found';
@@ -1073,26 +1099,30 @@ function registerTikTokEvents(entry) {
       return;
     }
 
-    if (lower === '!p' || lower === '!queue') {
+    if (lower === '!p' || lower === '!position' || lower === '!queue') {
       const record = getRecord(users, userKey);
       if (!record.name) {
         respond(tiktokId, 'No saved name. Use !q <YourName> to join the queue.', sourceUsername);
         cmd(`[${sourceUsername}] [!p] @${display} — no saved name`);
         return;
       }
+
+      await refreshLiveQueueFromServer();
+      await postPositionSpotlight(record.name, tiktokId);
+
       if (isPlaying(record.name)) {
         respond(tiktokId, `${record.name} is currently playing!`, sourceUsername);
-        cmd(`[${sourceUsername}] [!p] @${display} (${record.name}) → PLAYING`);
+        cmd(`[${sourceUsername}] [!p] @${display} (${record.name}) → PLAYING + overlay`);
         return;
       }
       const pos = getPosition(record.name);
       if (pos !== null) {
         respond(tiktokId, `${record.name} is #${pos} of ${liveQueue.length} in the queue.`, sourceUsername);
-        cmd(`[${sourceUsername}] [!p] @${display} (${record.name}) → #${pos}/${liveQueue.length}`);
+        cmd(`[${sourceUsername}] [!p] @${display} (${record.name}) → #${pos}/${liveQueue.length} + overlay`);
       } else {
         if (record.queued) setRecord(users, userKey, { name: record.name, queued: false });
         respond(tiktokId, `${record.name} is not in the queue. Type !q to rejoin.`, sourceUsername);
-        cmd(`[${sourceUsername}] [!p] @${display} (${record.name}) → not in queue`);
+        cmd(`[${sourceUsername}] [!p] @${display} (${record.name}) → not in queue + overlay`);
       }
       return;
     }
