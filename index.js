@@ -162,14 +162,14 @@ function saveUsers(users) {
 }
 
 function getRecord(users, userKey) {
-  const r = users[tiktokId];
+  const r = users[userKey];
   if (!r) return { name: '', queued: false };
   if (typeof r === 'string') return { name: r, queued: false };
   return { name: r.name || '', queued: Boolean(r.queued) };
 }
 
 function setRecord(users, userKey, record) {
-  users[tiktokId] = { name: record.name || '', queued: Boolean(record.queued) };
+  users[userKey] = { name: record.name || '', queued: Boolean(record.queued) };
   saveUsers(users);
   // Keep the admin panel's TikTok Saved Names list current after !q, !c, or !r.
   setTimeout(() => {
@@ -585,11 +585,11 @@ async function pollQueue() {
   ]);
 
   let changed = false;
-  for (const [tiktokId, raw] of Object.entries(users)) {
-    const record = getRecord(users, userKey);
+  for (const [storedKey, raw] of Object.entries(users)) {
+    const record = getRecord(users, storedKey);
     if (record.queued && record.name && !activeNames.has(record.name.toLowerCase())) {
-      warn(`↩  @${tiktokId} (${record.name}) removed from queue/playing — unlocked for rejoin`);
-      users[tiktokId] = { name: record.name, queued: false };
+      warn(`↩  @${displayUserKey(storedKey)} (${record.name}) removed from queue/playing — unlocked for rejoin`);
+      users[storedKey] = { name: record.name, queued: false };
       changed = true;
     }
   }
