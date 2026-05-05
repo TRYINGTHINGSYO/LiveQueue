@@ -61,7 +61,7 @@ const BASE_URL       = (process.env.QUEUE_API_URL || 'https://siegequeue.com').r
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || process.env.ADMIN_SECRET || '';
 const SESSION_ID     = process.env.TIKTOK_SESSION_ID || '';
 const SESSION_ID_2   = process.env.TIKTOK_SESSION_ID_2 || '';
-const DATA_FILE      = process.env.USER_DATA_FILE || './users.json';
+const DATA_FILE      = process.env.BOT_USERS_FILE || process.env.USER_DATA_FILE || './users.json';
 
 function parseSessionIdMap(value) {
   const out = new Map();
@@ -103,6 +103,8 @@ function getSessionIdForUsername(username) {
 let POLL_MS        = Number(process.env.POLL_MS      || 5_000);
 let COOLDOWN_MS    = Number(process.env.COOLDOWN_MS  || 8_000);
 let MAX_RETRY_MS   = Number(process.env.MAX_RETRY_MS || 120_000);
+const CONNECT_TIMEOUT_MS = Number(process.env.CONNECT_TIMEOUT_MS || 45_000);
+const LIVE_SCAN_MS       = Number(process.env.LIVE_SCAN_MS || 15_000);
 
 // Optional blocklists — also overwritten by server config.
 let BANNED_TIKTOK_USERS = new Set(
@@ -141,6 +143,7 @@ ${C.cyan}${C.bold}╔═══════════════════�
   API   : ${C.yellow}${BASE_URL}${C.reset}
   Auth  : ${ADMIN_PASSWORD ? `${C.green}✓ set${C.reset}` : `${C.red}✗ missing${C.reset}`}
   Cookie: ${SESSION_ID ? `${C.green}✓ primary set${C.reset}` : `${C.yellow}⚠ primary not set${C.reset}`} | Extra: ${SESSION_ID_2 || SESSION_IDS_BY_USER.size ? `${C.green}✓ set${C.reset}` : `${C.yellow}⚠ not set${C.reset}`}
+  Users : ${C.yellow}${DATA_FILE}${C.reset}
   Sync  : ${C.green}Admin panel config sync ENABLED${C.reset}
 
   ${C.dim}Commands: !q <name>  •  !q  •  !p  •  !c  •  !r  •  !help${C.reset}
@@ -842,6 +845,7 @@ function ensureStream(username) {
     conn: null,
     retryDelay: 15_000,
     reconnectTimer: null,
+    connectTimeout: null,
     connecting: false,
     connected: false,
     currentViewers: 0,
@@ -857,7 +861,9 @@ function disconnectStream(username) {
   const entry = streams.get(username);
   if (!entry) return;
   if (entry.reconnectTimer) clearTimeout(entry.reconnectTimer);
+  if (entry.connectTimeout) clearTimeout(entry.connectTimeout);
   entry.reconnectTimer = null;
+  entry.connectTimeout = null;
   entry.connecting = false;
   entry.connected = false;
   try { if (entry.conn) entry.conn.disconnect(); } catch (_) {}
@@ -908,12 +914,29 @@ function connectTikTok(username) {
   entry.lastConnectAttempt = Date.now();
   createFreshTikTokConnection(entry);
 
+  // If TikTok never answers while the live is offline/starting, do not stay stuck
+  // in "connecting" forever. Reset this stream and keep scanning for the live.
+  if (entry.connectTimeout) clearTimeout(entry.connectTimeout);
+  entry.connectTimeout = setTimeout(() => {
+    if (!entry.connected) {
+      warn(`TikTok connect timed out for @${entry.username}. Keeping it armed and trying again.`);
+      entry.connecting = false;
+      entry.connected = false;
+      try { if (entry.conn) entry.conn.disconnect(); } catch (_) {}
+      updateAggregateBotState();
+      postBotStatusToServer({ connected: botConnected, connecting: false, error: `@${entry.username}: connect timeout` });
+      scheduleReconnect(entry.username, 5_000);
+    }
+  }, CONNECT_TIMEOUT_MS);
+
   info(`Connecting to @${entry.username}…`);
   updateAggregateBotState();
   postBotStatusToServer({ connecting: true, connected: botConnected });
 
   entry.conn.connect()
     .then(state => {
+      if (entry.connectTimeout) clearTimeout(entry.connectTimeout);
+      entry.connectTimeout = null;
       entry.connecting = false;
       entry.retryDelay = 15_000;
       entry.connected = true;
@@ -924,6 +947,8 @@ function connectTikTok(username) {
       postBotStatusToServer({ connected: botConnected, connecting: false, roomId: currentRoomId });
     })
     .catch(e => {
+      if (entry.connectTimeout) clearTimeout(entry.connectTimeout);
+      entry.connectTimeout = null;
       entry.connecting = false;
       entry.connected = false;
       entry.currentRoomId = null;
@@ -960,17 +985,30 @@ function connectAllTikTok() {
 
 function keepTikTokConnectionsAlive() {
   const activeUsers = getStreamUsers();
+  const now = Date.now();
+
   for (const username of activeUsers) {
     const entry = ensureStream(username);
     if (!entry) continue;
+
+    // If a connection attempt gets stuck, force it loose and retry.
+    if (entry.connecting && entry.lastConnectAttempt && now - entry.lastConnectAttempt > CONNECT_TIMEOUT_MS + 10_000) {
+      warn(`Watchdog: @${entry.username} has been connecting too long — resetting connection.`);
+      entry.connecting = false;
+      entry.connected = false;
+      if (entry.connectTimeout) clearTimeout(entry.connectTimeout);
+      entry.connectTimeout = null;
+      try { if (entry.conn) entry.conn.disconnect(); } catch (_) {}
+    }
+
     if (!entry.connected && !entry.connecting && !entry.reconnectTimer) {
-      info(`Watchdog: @${entry.username} is not connected — trying again now.`);
+      info(`Live scanner: @${entry.username} is not connected — checking again now.`);
       connectTikTok(entry.username);
     }
   }
 }
 
-setInterval(keepTikTokConnectionsAlive, 30_000);
+setInterval(keepTikTokConnectionsAlive, LIVE_SCAN_MS);
 
 // tiktok-live-connector is read-only; this logs what the bot would say.
 function respond(tiktokId, message, sourceUsername = '') {
@@ -1213,6 +1251,8 @@ function registerTikTokEvents(entry) {
   tiktok.on('comment', data => handleChatCommand(data, 'comment'));
 
   tiktok.on('disconnected', () => {
+    if (entry.connectTimeout) clearTimeout(entry.connectTimeout);
+    entry.connectTimeout = null;
     entry.connected = false;
     entry.connecting = false;
     entry.currentRoomId = null;
