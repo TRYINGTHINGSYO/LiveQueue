@@ -832,11 +832,15 @@ function registerTikTokEvents(entry) {
       return;
     }
 
-    if (lower !== '!help' && isOnCooldown(userKey)) {
-      cmd(`[${sourceUsername}] [cooldown] @${tiktokId} — ignored (${COOLDOWN_MS / 1000}s cooldown)`);
+    // Only rate-limit queue JOIN commands.
+    // Do NOT let !r / !c / !p consume the cooldown, because TikTok can deliver
+    // messages in a burst. Example: !r followed immediately by !q name should work.
+    const isJoinCommand = lower.startsWith('!q');
+    const cooldownKey = `${userKey}:join`;
+    if (isJoinCommand && isOnCooldown(cooldownKey)) {
+      cmd(`[${sourceUsername}] [cooldown] @${tiktokId} — ignored join (${COOLDOWN_MS / 1000}s cooldown)`);
       return;
     }
-    setCooldown(userKey);
 
     if (lower === '!help') {
       respond(tiktokId, '!q <name> = save name + join | !q = rejoin saved name | !p = position | !c = clear from queue | !r = reset saved name', sourceUsername);
@@ -937,6 +941,7 @@ function registerTikTokEvents(entry) {
     }
 
     if (!lower.startsWith('!q')) return;
+    setCooldown(cooldownKey);
 
     const afterCommand = msg.replace(/^!q(?:ueue)?/i, '').trim();
     const record       = getRecord(users, userKey);
