@@ -1172,6 +1172,8 @@ setInterval(() => postBotStatusToServer(), 30_000);
 // A username change triggers a full reconnect.
 
 setInterval(fetchBotConfigFromServer, 60_000);
+// Apply admin name edits quickly so saved names are written into users.json soon after you finish editing.
+setInterval(applyAdminSavedNameOverrides, 5_000);
 
 // ── Stats printer (every 5 min) ─────────────────────────────────────────────
 
