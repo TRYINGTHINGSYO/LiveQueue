@@ -177,18 +177,39 @@ function setRecord(users, userKey, record) {
   }, 0);
 }
 
-// Use a different saved-name/lock key for each stream.
-// This fixes the problem where @fsblaker joining @barbariandino's live
-// gets blocked because @fsblaker already has a saved/queued record on his own live.
+// Saved-name/lock key is GLOBAL per TikTok account, not per stream.
+// This means @somebody has ONE Ubisoft name across @fsblaker and @barbariandino.
+// They cannot use one Ubisoft name in your queue and a different one in hers.
 function streamUserKey(sourceUsername, tiktokId) {
-  const stream = normalizeTikTokUsername(sourceUsername || 'main');
-  const user = normalizeTikTokUsername(tiktokId || 'unknown');
-  return `${stream}:${user}`;
+  return normalizeTikTokUsername(tiktokId || 'unknown');
 }
 
 function displayUserKey(key) {
   const parts = String(key || '').split(':');
   return parts.length > 1 ? parts.slice(1).join(':') : String(key || '');
+}
+
+function canonicalName(raw) {
+  return normalizeForFilter(raw);
+}
+
+function migrateUsersToGlobalKeys() {
+  let changed = false;
+  for (const key of Object.keys(users)) {
+    if (!key.includes(':')) continue;
+    const globalKey = normalizeTikTokUsername(displayUserKey(key));
+    if (!globalKey) continue;
+    const oldRecord = getRecord(users, key);
+    const existing = getRecord(users, globalKey);
+    if (!existing.name && oldRecord.name) {
+      users[globalKey] = oldRecord;
+    } else if (existing.name && oldRecord.name && canonicalName(existing.name) === canonicalName(oldRecord.name)) {
+      users[globalKey] = { name: existing.name, queued: existing.queued || oldRecord.queued };
+    }
+    delete users[key];
+    changed = true;
+  }
+  if (changed) saveUsers(users);
 }
 
 // ── Name sanitiser and filters ──────────────────────────────────────────────
@@ -349,6 +370,63 @@ async function removeFromQueue(name) {
 let _pollIntervalHandle = null;
 let _lastStreamUsersKey = JSON.stringify(getStreamUsers());
 
+async function applyAdminSavedNameOverrides() {
+  if (!ADMIN_PASSWORD) return;
+  try {
+    const r = await fetchWithTimeout(`${BASE_URL}/api/admin/bot-user-overrides`, { headers: authHeaders() }, 6_000);
+    if (!r.ok) return;
+    const data = await r.json();
+    const edits = data.edits || data.overrides || {};
+    let changed = false;
+
+    for (const [rawTikTok, entry] of Object.entries(edits)) {
+      const tiktok = normalizeTikTokUsername(displayUserKey(rawTikTok));
+      const desired = String(entry?.ubisoft || entry?.name || entry || '').trim();
+      if (!tiktok || !desired) continue;
+      const valid = validateName(desired);
+      if (!valid.ok) continue;
+      const clean = valid.name;
+      const old = getRecord(users, tiktok);
+      if (canonicalName(old.name) === canonicalName(clean)) continue;
+
+      // If their old saved name is currently in queue/playing, rename it on the website too.
+      if (old.name && (isInQueue(old.name) || isPlaying(old.name))) {
+        await renamePlayerOnServer(old.name, clean);
+        await refreshLiveQueueFromServer();
+      }
+
+      users[tiktok] = { name: clean, queued: old.queued };
+      changed = true;
+      cmd(`[admin-sync] @${tiktok} saved Ubisoft name set to ${clean}`);
+    }
+
+    if (changed) {
+      saveUsers(users);
+      postBotStatusToServer().catch(() => {});
+    }
+  } catch (e) {
+    if (!String(e.message || '').includes('aborted')) warn(`[sync] bot-user-overrides fetch error: ${e.message}`);
+  }
+}
+
+async function renamePlayerOnServer(oldName, newName) {
+  if (!ADMIN_PASSWORD) return 'error';
+  try {
+    const r = await fetchWithTimeout(`${BASE_URL}/api/admin/rename-player`, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({ oldName, newName }),
+    }, 8_000);
+    const text = await r.text();
+    if (r.ok) return 'renamed';
+    warn(`[admin-sync] rename-player failed ${oldName} → ${newName}: ${r.status} ${text}`);
+    return 'error';
+  } catch (e) {
+    warn(`[admin-sync] rename-player network error ${oldName} → ${newName}: ${e.message}`);
+    return 'error';
+  }
+}
+
 /**
  * Fetch bot config from the server admin panel.
  * Applies mutable settings live; reconnects TikTok if username changed.
@@ -362,6 +440,7 @@ async function fetchBotConfigFromServer() {
       return;
     }
     const cfg = await r.json();
+    await applyAdminSavedNameOverrides();
 
     // Apply mutable settings
     if (Number.isFinite(cfg.cooldownMs) && cfg.cooldownMs >= 1_000) {
@@ -542,16 +621,29 @@ function ownNameIsActive(record) {
   return Boolean(record.name) && (record.queued || isInQueue(record.name) || isPlaying(record.name));
 }
 function isNameTakenByOther(name, tiktokId) {
-  const n = String(name || '').toLowerCase();
-  if (!n) return false;
-  if (!isInQueue(name) && !isPlaying(name)) return false;
+  const key = canonicalName(name);
+  if (!key) return false;
+
+  // 1) Block against every saved TikTok → Ubisoft mapping, even if they are not
+  // currently in queue. Names stay static until admin edits them or the user resets.
+  for (const [ownerKey, rawRecord] of Object.entries(users)) {
+    const owner = normalizeTikTokUsername(displayUserKey(ownerKey));
+    if (owner === normalizeTikTokUsername(tiktokId)) continue;
+    const record = getRecord(users, ownerKey);
+    if (record.name && canonicalName(record.name) === key) return true;
+  }
+
+  // 2) Also block against names currently in the live website queue / playing list.
   const ownRecord = getRecord(users, tiktokId);
-  return ownRecord.name.toLowerCase() !== n;
+  const ownKey = canonicalName(ownRecord.name);
+  if ((isInQueue(name) || isPlaying(name)) && ownKey !== key) return true;
+  return false;
 }
 
 // ── Queue state poller ──────────────────────────────────────────────────────
 
 const users = loadUsers();
+migrateUsersToGlobalKeys();
 
 async function refreshLiveQueueFromServer() {
   const state = await fetchQueueState();
