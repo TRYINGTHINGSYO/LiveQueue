@@ -146,7 +146,7 @@ ${C.cyan}${C.bold}╔═══════════════════�
   Users : ${C.yellow}${DATA_FILE}${C.reset}
   Sync  : ${C.green}Admin panel config sync ENABLED${C.reset}
 
-  ${C.dim}Commands: !q <name>  •  !q  •  !p  •  !c  •  !r  •  !help${C.reset}
+  ${C.dim}Commands: !q <name>  •  !q  •  !c  •  !r${C.reset}
 `);
 }
 
@@ -1033,7 +1033,7 @@ function registerTikTokEvents(entry) {
     const msg      = String(data?.comment || data?.text || data?.content || data?.msg || '').trim();
     const lower    = msg.toLowerCase();
 
-    const isCmd = lower === '!c' || lower === '!clear' || lower === '!r' || lower === '!reset' || lower === '!p' || lower === '!help' || lower === '!queue' || lower.startsWith('!q');
+    const isCmd = lower === '!c' || lower === '!clear' || lower === '!r' || lower === '!reset' || lower.startsWith('!q');
     if (!isCmd) return;
 
     cmd(`[${sourceUsername}] command heard from @${display} / key=${userKey}: ${msg}`);
@@ -1054,7 +1054,7 @@ function registerTikTokEvents(entry) {
     }
 
     // Only rate-limit queue JOIN commands.
-    // Do NOT let !r / !c / !p consume the cooldown, because TikTok can deliver
+    // Do NOT let !r / !c consume the cooldown, because TikTok can deliver
     // messages in a burst. Example: !r followed immediately by !q name should work.
     const isJoinCommand = lower.startsWith('!q');
     const cooldownKey = `${userKey}:join`;
@@ -1063,11 +1063,6 @@ function registerTikTokEvents(entry) {
       return;
     }
 
-    if (lower === '!help') {
-      respond(tiktokId, '!q <name> = save name + join | !q = rejoin saved name | !p = position | !c = clear from queue | !r = reset saved name', sourceUsername);
-      cmd(`[${sourceUsername}] [!help] @${display}`);
-      return;
-    }
 
     if (lower === '!c' || lower === '!clear') {
       const record = getRecord(users, userKey);
@@ -1134,34 +1129,6 @@ function registerTikTokEvents(entry) {
       setRecord(users, userKey, { name: '', queued: false });
       respond(tiktokId, `Reset saved name "${old}". Use !q <NewUbisoftName> to set a new one.`, sourceUsername);
       cmd(`[${sourceUsername}] [!r] @${display} reset "${old}"`);
-      return;
-    }
-
-    if (lower === '!p' || lower === '!position' || lower === '!queue') {
-      const record = getRecord(users, userKey);
-      if (!record.name) {
-        respond(tiktokId, 'No saved name. Use !q <YourName> to join the queue.', sourceUsername);
-        cmd(`[${sourceUsername}] [!p] @${display} — no saved name`);
-        return;
-      }
-
-      await refreshLiveQueueFromServer();
-      await postPositionSpotlight(record.name, tiktokId);
-
-      if (isPlaying(record.name)) {
-        respond(tiktokId, `${record.name} is currently playing!`, sourceUsername);
-        cmd(`[${sourceUsername}] [!p] @${display} (${record.name}) → PLAYING + overlay`);
-        return;
-      }
-      const pos = getPosition(record.name);
-      if (pos !== null) {
-        respond(tiktokId, `${record.name} is #${pos} of ${liveQueue.length} in the queue.`, sourceUsername);
-        cmd(`[${sourceUsername}] [!p] @${display} (${record.name}) → #${pos}/${liveQueue.length} + overlay`);
-      } else {
-        if (record.queued) setRecord(users, userKey, { name: record.name, queued: false });
-        respond(tiktokId, `${record.name} is not in the queue. Type !q to rejoin.`, sourceUsername);
-        cmd(`[${sourceUsername}] [!p] @${display} (${record.name}) → not in queue + overlay`);
-      }
       return;
     }
 
