@@ -193,6 +193,51 @@ function canonicalName(raw) {
   return normalizeForFilter(raw);
 }
 
+function nameSkeleton(raw) {
+  return canonicalName(raw).replace(/[il]/g, 'l');
+}
+
+function boundedEditDistance(a, b, maxDistance = 2) {
+  a = String(a || '');
+  b = String(b || '');
+  if (a === b) return 0;
+  if (Math.abs(a.length - b.length) > maxDistance) return maxDistance + 1;
+
+  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    const curr = [i];
+    let rowMin = curr[0];
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      const val = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost);
+      curr[j] = val;
+      if (val < rowMin) rowMin = val;
+    }
+    if (rowMin > maxDistance) return maxDistance + 1;
+    prev = curr;
+  }
+  return prev[b.length];
+}
+
+function namesAreTooClose(candidate, existing) {
+  const a = canonicalName(candidate);
+  const b = canonicalName(existing);
+  if (!a || !b) return false;
+  if (a === b) return true;
+
+  const minLen = Math.min(a.length, b.length);
+  const allowedDistance = minLen >= 8 ? 2 : 1;
+  if (minLen >= 4 && (a.includes(b) || b.includes(a))) return true;
+  if (minLen >= 5 && boundedEditDistance(a, b, allowedDistance) <= allowedDistance) return true;
+
+  const sa = nameSkeleton(candidate);
+  const sb = nameSkeleton(existing);
+  if (sa === sb) return true;
+  if (minLen >= 5 && boundedEditDistance(sa, sb, allowedDistance) <= allowedDistance) return true;
+
+  return false;
+}
+
 function migrateUsersToGlobalKeys() {
   let changed = false;
   for (const key of Object.keys(users)) {
@@ -620,24 +665,44 @@ function getPosition(name) {
 function ownNameIsActive(record) {
   return Boolean(record.name) && (record.queued || isInQueue(record.name) || isPlaying(record.name));
 }
-function isNameTakenByOther(name, tiktokId) {
+function findNameTakenByOther(name, tiktokId) {
   const key = canonicalName(name);
-  if (!key) return false;
+  if (!key) return null;
+
+  const self = normalizeTikTokUsername(tiktokId);
 
   // 1) Block against every saved TikTok → Ubisoft mapping, even if they are not
   // currently in queue. Names stay static until admin edits them or the user resets.
-  for (const [ownerKey, rawRecord] of Object.entries(users)) {
+  for (const [ownerKey] of Object.entries(users)) {
     const owner = normalizeTikTokUsername(displayUserKey(ownerKey));
-    if (owner === normalizeTikTokUsername(tiktokId)) continue;
+    if (owner === self) continue;
     const record = getRecord(users, ownerKey);
-    if (record.name && canonicalName(record.name) === key) return true;
+    if (record.name && namesAreTooClose(name, record.name)) {
+      return record.name;
+    }
   }
 
   // 2) Also block against names currently in the live website queue / playing list.
   const ownRecord = getRecord(users, tiktokId);
   const ownKey = canonicalName(ownRecord.name);
-  if ((isInQueue(name) || isPlaying(name)) && ownKey !== key) return true;
-  return false;
+  for (const p of [...liveQueue, ...livePlaying]) {
+    if (!p.name) continue;
+    if (ownKey && canonicalName(p.name) === ownKey) continue;
+    if (namesAreTooClose(name, p.name)) return p.name;
+  }
+
+  return null;
+}
+
+function isNameTakenByOther(name, tiktokId) {
+  return Boolean(findNameTakenByOther(name, tiktokId));
+}
+
+function nameTakenMessage(name, tiktokId) {
+  const conflict = findNameTakenByOther(name, tiktokId);
+  if (!conflict) return '';
+  if (canonicalName(name) === canonicalName(conflict)) return `"${name}" is already taken.`;
+  return `"${name}" is too close to "${conflict}". Pick a more different Ubisoft name.`;
 }
 
 // ── Queue state poller ──────────────────────────────────────────────────────
@@ -1066,9 +1131,10 @@ function registerTikTokEvents(entry) {
         return;
       }
 
-      if (isNameTakenByOther(clean, userKey)) {
-        respond(tiktokId, `"${clean}" is already active. Try a different name.`, sourceUsername);
-        cmd(`[${sourceUsername}] [!q] @${display} ✗ name "${clean}" taken by another user`);
+      const takenMsg = nameTakenMessage(clean, userKey);
+      if (takenMsg) {
+        respond(tiktokId, takenMsg, sourceUsername);
+        cmd(`[${sourceUsername}] [!q] @${display} ✗ name "${clean}" blocked by name checker`);
         return;
       }
       setRecord(users, userKey, { name: clean, queued: false });
@@ -1089,9 +1155,10 @@ function registerTikTokEvents(entry) {
     }
 
     if (record.name) {
-      if (isNameTakenByOther(record.name, userKey)) {
-        respond(tiktokId, `"${record.name}" is taken. Use !r to reset your saved name after the host removes the old slot.`, sourceUsername);
-        cmd(`[${sourceUsername}] [!q] @${display} ✗ saved name "${record.name}" taken by another`);
+      const takenMsg = nameTakenMessage(record.name, userKey);
+      if (takenMsg) {
+        respond(tiktokId, `${takenMsg} Use !r to reset your saved name after the host removes the old slot.`, sourceUsername);
+        cmd(`[${sourceUsername}] [!q] @${display} ✗ saved name "${record.name}" blocked by name checker`);
         return;
       }
       const result = await addToQueue(record.name);
