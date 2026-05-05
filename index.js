@@ -361,7 +361,7 @@ async function fetchQueueState() {
 
 function bodyLooksAlready(text) {
   const t = String(text || '').toLowerCase();
-  return t.includes('already') || t.includes('taken') || t.includes('duplicate') || t.includes('in queue') || t.includes('playing');
+  return t.includes('already in queue') || t.includes('in the queue') || t.includes('already playing') || t.includes('currently playing');
 }
 
 async function addToQueue(name) {
