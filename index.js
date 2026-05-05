@@ -164,6 +164,33 @@ function saveUsers(users) {
   catch (e) { err('Could not save users.json:', e.message); }
 }
 
+
+function replaceUsersInMemory(nextUsers) {
+  for (const key of Object.keys(users)) delete users[key];
+  for (const [key, value] of Object.entries(nextUsers || {})) {
+    users[normalizeTikTokUsername(displayUserKey(key)) || key] = value;
+  }
+}
+
+function reloadUsersFromDisk() {
+  try {
+    if (!fs.existsSync(DATA_FILE)) return false;
+    const fresh = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    if (!fresh || typeof fresh !== 'object' || Array.isArray(fresh)) return false;
+
+    const currentKey = JSON.stringify(users);
+    const freshKey = JSON.stringify(fresh);
+    if (currentKey === freshKey) return false;
+
+    replaceUsersInMemory(fresh);
+    migrateUsersToGlobalKeys();
+    return true;
+  } catch (e) {
+    warn(`Could not reload users.json: ${e.message}`);
+    return false;
+  }
+}
+
 function getRecord(users, userKey) {
   const r = users[userKey];
   if (!r) return { name: '', queued: false };
@@ -445,6 +472,7 @@ let _pollIntervalHandle = null;
 let _lastStreamUsersKey = JSON.stringify(getStreamUsers());
 
 async function applyAdminSavedNameOverrides() {
+  reloadUsersFromDisk();
   if (!ADMIN_PASSWORD) return;
   try {
     const r = await fetchWithTimeout(`${BASE_URL}/api/admin/bot-user-overrides`, { headers: authHeaders() }, 6_000);
@@ -698,22 +726,12 @@ function findNameTakenByOther(name, tiktokId) {
   const key = canonicalName(name);
   if (!key) return null;
 
-  const self = normalizeTikTokUsername(tiktokId);
-
-  // 1) Block against every saved TikTok → Ubisoft mapping, even if they are not
-  // currently in queue. Names stay static until admin edits them or the user resets.
-  for (const [ownerKey] of Object.entries(users)) {
-    const owner = normalizeTikTokUsername(displayUserKey(ownerKey));
-    if (owner === self) continue;
-    const record = getRecord(users, ownerKey);
-    if (record.name && namesAreTooClose(name, record.name)) {
-      return record.name;
-    }
-  }
-
-  // 2) Also block against names currently in the live website queue / playing list.
+  // Only block names that are actually active on the website right now.
+  // Saved TikTok names in users.json are NOT treated as active queue slots,
+  // because that caused false “name is taken” errors after a person left queue.
   const ownRecord = getRecord(users, tiktokId);
   const ownKey = canonicalName(ownRecord.name);
+
   for (const p of [...liveQueue, ...livePlaying]) {
     if (!p.name) continue;
     if (ownKey && canonicalName(p.name) === ownKey) continue;
@@ -1033,6 +1051,9 @@ function registerTikTokEvents(entry) {
     const msg      = String(data?.comment || data?.text || data?.content || data?.msg || '').trim();
     const lower    = msg.toLowerCase();
 
+    // Pick up admin edits/deletes to saved TikTok names without restarting the bot.
+    reloadUsersFromDisk();
+
     const isCmd = lower === '!c' || lower === '!clear' || lower === '!r' || lower === '!reset' || lower.startsWith('!q');
     if (!isCmd) return;
 
@@ -1126,7 +1147,9 @@ function registerTikTokEvents(entry) {
       }
 
       const old = record.name;
-      setRecord(users, userKey, { name: '', queued: false });
+      delete users[userKey];
+      saveUsers(users);
+      setTimeout(() => { try { postBotStatusToServer().catch(() => {}); } catch (_) {} }, 0);
       respond(tiktokId, `Reset saved name "${old}". Use !q <NewUbisoftName> to set a new one.`, sourceUsername);
       cmd(`[${sourceUsername}] [!r] @${display} reset "${old}"`);
       return;
