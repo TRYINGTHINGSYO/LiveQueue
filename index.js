@@ -178,6 +178,7 @@ const JOIN_COMMAND_RE = /^(?:!q|!queue|!join|!play|\/q|q)(?:\s+|$)/i;
 // Bare-name mode treats a clean username-looking chat message as a join attempt.
 // Set BARE_NAME_MODE=false in Railway if you ever want to disable this.
 let BARE_NAME_MODE = String(process.env.BARE_NAME_MODE || 'true').toLowerCase() !== 'false';
+const DEBUG_BARE_NAME = envBool(process.env.DEBUG_BARE_NAME, false);
 const BARE_NAME_BLOCKLIST = new Set([
   'hi','hey','hello','yo','yes','no','ok','okay','lol','lmao','bro','bruh','nah','nahh','nahhh',
   'ready','start','stop','queue','join','play','game','ranked','custom','customs','siege','rainbow',
@@ -202,30 +203,49 @@ function looksLikeKnownPlayerName(candidate, userKey = '') {
   return '';
 }
 
+function debugBareDecision(rawMsg, userKey, passed, reason, normalizedName = '') {
+  if (!DEBUG_BARE_NAME) return;
+  const safeMsg = String(rawMsg || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+  const key = userKey || '-';
+  const result = passed ? `PASS → ${normalizedName}` : 'BLOCK';
+  cmd(`[bare-debug] ${result} key=${key} msg="${safeMsg}" reason=${reason}`);
+}
+
 function getBareJoinName(rawMsg, userKey = '') {
-  if (!BARE_NAME_MODE) return '';
+  const pass = (name, reason) => {
+    debugBareDecision(rawMsg, userKey, true, reason, name);
+    return name;
+  };
+  const block = (reason) => {
+    debugBareDecision(rawMsg, userKey, false, reason);
+    return '';
+  };
+
+  if (!BARE_NAME_MODE) return block('BARE_NAME_MODE disabled');
   const text = String(rawMsg || '').trim();
-  if (!text) return '';
+  if (!text) return block('empty message');
 
   // Never treat real commands or normal punctuation-heavy chat as bare names.
-  if (text.startsWith('!') || text.startsWith('/')) return '';
-  if (text.length > 32) return '';
-  if (/[?"'`~:;,#$%^&*()[\]{}=+\\|<>]/.test(text)) return '';
+  if (text.startsWith('!') || text.startsWith('/')) return block('starts with command prefix');
+  if (text.length > 32) return block('too long before compaction');
+  if (/[?"'`~:;,#$%^&*()[\]{}=+\\|<>]/.test(text)) return block('blocked punctuation');
 
   const words = text.split(/\s+/).filter(Boolean);
 
   const compact = text.replace(/\s+/g, '');
-  if (compact.length < 3 || compact.length > 20) return '';
-  if (!/^[A-Za-z0-9_.\-\s]+$/.test(text)) return '';
-  if (!/[A-Za-z]/.test(compact)) return '';
+  if (compact.length < 3) return block('compacted length below 3');
+  if (compact.length > 20) return block('compacted length above 20');
+  if (!/^[A-Za-z0-9_.\-\s]+$/.test(text)) return block('invalid bare-name characters');
+  if (!/[A-Za-z]/.test(compact)) return block('no letters');
 
   const normalized = normalizeForFilter(compact);
-  if (!normalized || BARE_NAME_BLOCKLIST.has(normalized)) return '';
+  if (!normalized) return block('normalizes to empty');
+  if (BARE_NAME_BLOCKLIST.has(normalized)) return block(`blocklisted bare word: ${normalized}`);
 
   // Safest path: allow bare messages that match this viewer's saved name,
   // another known saved name that is not taken by someone else, or a current queue slot.
   const known = looksLikeKnownPlayerName(compact, userKey);
-  if (known) return known;
+  if (known) return pass(known, 'known saved/queued name match');
 
   // Do not turn normal sentences into names. Example TikTok chat like
   // "I got 975" used to compact into "Igot975" and pass because it had a number.
@@ -235,16 +255,18 @@ function getBareJoinName(rawMsg, userKey = '') {
     'got','get','have','has','had','need','want','wanna','can','cant','cannot','could','would','should',
     'am','are','is','was','were','be','been','being','do','does','did','done','go','going','play','playing',
     'add','invite','join','queue','put','let','make','run','start','stop','wait','hold','ready',
-    'the','a','an','to','for','of','in','on','with','and','or','but','if','so','then','just','only',
+    'the','a','an','to','for','of','in','on','with','and','or','but','if','so','then','just','only','it',
     'gg','lol','lmao','bro','bruh','nah','yes','no','ok','okay','hi','hey','hello','yo'
   ]);
   const normalizedWords = words.map((w) => normalizeForFilter(w));
 
   // New bare names with 3+ words are too risky. Known/saved/queued matches already returned above.
-  if (words.length > 2) return '';
+  if (words.length > 2) return block('3+ words, likely normal chat');
 
   // If the message contains sentence words, ignore it as chat unless it matched a known player above.
-  if (words.length > 1 && normalizedWords.some((w) => naturalPhraseWords.has(w))) return '';
+  if (words.length > 1 && normalizedWords.some((w) => naturalPhraseWords.has(w))) {
+    return block('multi-word sentence word detected');
+  }
 
   // For new bare names, be MUCH stricter than !q mode so normal chat does not flood the queue.
   // Accept only if it has clear username signals:
@@ -260,34 +282,35 @@ function getBareJoinName(rawMsg, userKey = '') {
   // "Igot975"    → alpha segment "igot" → split into "i"+"got" → both phrase words → BLOCK
   // "imready2"   → alpha segment "imready" → "im"+"ready" → both phrase words → BLOCK
   // "addme1"     → alpha segment "addme" → "add"+"me" → both phrase words → BLOCK
-  // "braybray15" → alpha segment "braybray" → no split produces two phrase words → PASS
-  // "LilJr99"    → alpha segment "liljr" → no valid phrase-word split → PASS
-  //
-  // Algorithm: for each alpha segment, try every prefix/suffix split (min 1 char each).
-  // If ANY split produces two substrings that are both in naturalPhraseWords, it is a phrase.
-  // Also check raw words (multi-word input like ["I","got","975"]) for the spaced case.
+  // "caniplay9"  → alpha segment "caniplay" → "can"+"i"+"play" → all phrase words → BLOCK
+  // "braybray15" → alpha segment "braybray" → no split produces phrase words → PASS
   if (hasNumber || words.length > 1) {
     const rawWordNorms = words.map(w => normalizeForFilter(w));
     // Direct word match (catches multi-word spaced phrases)
-    if (rawWordNorms.some(w => w.length > 0 && naturalPhraseWords.has(w))) return '';
+    const phraseWord = rawWordNorms.find(w => w.length > 0 && naturalPhraseWords.has(w));
+    if (phraseWord) return block(`phrase word detected: ${phraseWord}`);
 
     // Segment split match (catches single-token smashed phrases)
     const alphaSegments = compact.split(/[0-9]+/).filter(Boolean).map(s => normalizeForFilter(s));
     for (const seg of alphaSegments) {
       if (!seg) continue;
       // Whole segment is a phrase word
-      if (naturalPhraseWords.has(seg)) return '';
+      if (naturalPhraseWords.has(seg)) return block(`phrase-smash segment is word: ${seg}`);
       // Try every 2-part prefix+suffix split
       for (let cut = 1; cut < seg.length; cut++) {
         const prefix = seg.slice(0, cut);
         const suffix = seg.slice(cut);
-        if (naturalPhraseWords.has(prefix) && naturalPhraseWords.has(suffix)) return '';
+        if (naturalPhraseWords.has(prefix) && naturalPhraseWords.has(suffix)) {
+          return block(`phrase-smash split: ${prefix}+${suffix}`);
+        }
       }
       // Try every 3-part split (catches "caniplay" → "can"+"i"+"play")
       for (let c1 = 1; c1 < seg.length - 1; c1++) {
         for (let c2 = c1 + 1; c2 < seg.length; c2++) {
           const p1 = seg.slice(0, c1), p2 = seg.slice(c1, c2), p3 = seg.slice(c2);
-          if (naturalPhraseWords.has(p1) && naturalPhraseWords.has(p2) && naturalPhraseWords.has(p3)) return '';
+          if (naturalPhraseWords.has(p1) && naturalPhraseWords.has(p2) && naturalPhraseWords.has(p3)) {
+            return block(`phrase-smash split: ${p1}+${p2}+${p3}`);
+          }
         }
       }
     }
@@ -295,16 +318,21 @@ function getBareJoinName(rawMsg, userKey = '') {
 
   // Spaces are risky. Only allow spaced bare messages if they also have a number,
   // username punctuation, mixed caps, or match a known queue/saved name above.
-  if (words.length > 1 && !(hasNumber || hasSeparator || hasMixedCase || hasAllCapsStyle || hasXxStyle)) return '';
+  if (words.length > 1 && !(hasNumber || hasSeparator || hasMixedCase || hasAllCapsStyle || hasXxStyle)) {
+    return block('spaced message without username signal');
+  }
 
   // Single all-lowercase words with no numbers/punctuation are usually normal chat.
   // They can still join by typing !q name. Bare fallback should not guess these.
-  if (!(hasNumber || hasSeparator || hasMixedCase || hasAllCapsStyle || hasXxStyle)) return '';
+  if (!(hasNumber || hasSeparator || hasMixedCase || hasAllCapsStyle || hasXxStyle)) {
+    return block('missing username signal');
+  }
 
   const valid = validateName(text);
-  if (!valid.ok) return '';
-  return valid.name;
+  if (!valid.ok) return block(`validateName failed: ${valid.error || 'invalid name'}`);
+  return pass(valid.name, 'new bare username signal accepted');
 }
+
 // ── Persistent user store ───────────────────────────────────────────────────
 
 function loadUsers() {
