@@ -146,7 +146,7 @@ ${C.cyan}${C.bold}╔═══════════════════�
   Users : ${C.yellow}${DATA_FILE}${C.reset}
   Sync  : ${C.green}Admin panel config sync ENABLED${C.reset}
 
-  ${C.dim}Commands: !q <name>  •  !Q <name>  •  !queue <name>  •  !q  •  !c  •  !r${C.reset}
+  ${C.dim}Commands: !q <name>  •  plain name fallback  •  !q  •  !c  •  !r${C.reset}
 `);
 }
 
@@ -155,6 +155,83 @@ ${C.cyan}${C.bold}╔═══════════════════�
 // Examples accepted: !q Blake, !Q Blake, !queue Blake, !join Blake, !play Blake, /q Blake, q Blake
 const JOIN_COMMAND_RE = /^(?:!q|!queue|!join|!play|\/q|q)(?:\s+|$)/i;
 
+
+// TikTok sometimes strips or hides the !q part, so the bot may only receive the name.
+// Bare-name mode treats a clean username-looking chat message as a join attempt.
+// Set BARE_NAME_MODE=false in Railway if you ever want to disable this.
+const BARE_NAME_MODE = String(process.env.BARE_NAME_MODE || 'true').toLowerCase() !== 'false';
+const BARE_NAME_BLOCKLIST = new Set([
+  'hi','hey','hello','yo','yes','no','ok','okay','lol','lmao','bro','bruh','nah','nahh','nahhh',
+  'ready','start','stop','queue','join','play','game','ranked','custom','customs','siege','rainbow',
+  'again','wait','hold','invite','inv','me','mine','name','username','ubisoft','ubi','clear','reset'
+]);
+
+function looksLikeKnownPlayerName(candidate, userKey = '') {
+  const clean = String(candidate || '').replace(/\s+/g, '');
+  if (!clean) return '';
+
+  // Own saved name is always safe. This lets someone type only their saved name
+  // when TikTok strips the !q part.
+  const ownRecord = getRecord(users, userKey);
+  if (ownRecord.name && namesAreTooClose(clean, ownRecord.name)) return ownRecord.name;
+
+  // If the exact/near name is already known from saved users or the current website queue,
+  // allow the bare message and normalize to the known spelling. This is what catches
+  // "lilcoper tretch" -> "LilcoperStretch" without accepting random chat.
+  const knownName = findKnownNameForInput(clean, userKey);
+  if (knownName) return knownName;
+
+  return '';
+}
+
+function getBareJoinName(rawMsg, userKey = '') {
+  if (!BARE_NAME_MODE) return '';
+  const text = String(rawMsg || '').trim();
+  if (!text) return '';
+
+  // Never treat real commands or normal punctuation-heavy chat as bare names.
+  if (text.startsWith('!') || text.startsWith('/')) return '';
+  if (text.length > 32) return '';
+  if (/[?"'`~:;,#$%^&*()[\]{}=+\\|<>]/.test(text)) return '';
+
+  const words = text.split(/\s+/).filter(Boolean);
+  if (words.length > 3) return '';
+
+  const compact = text.replace(/\s+/g, '');
+  if (compact.length < 3 || compact.length > 20) return '';
+  if (!/^[A-Za-z0-9_.\-\s]+$/.test(text)) return '';
+  if (!/[A-Za-z]/.test(compact)) return '';
+
+  const normalized = normalizeForFilter(compact);
+  if (!normalized || BARE_NAME_BLOCKLIST.has(normalized)) return '';
+
+  // Safest path: allow bare messages that match this viewer's saved name,
+  // another known saved name that is not taken by someone else, or a current queue slot.
+  const known = looksLikeKnownPlayerName(compact, userKey);
+  if (known) return known;
+
+  // For new bare names, be MUCH stricter than !q mode so normal chat does not flood the queue.
+  // Accept only if it has clear username signals:
+  //   braybray15, bray bray15, kouncil.b0t, SIMZER-_-, xXBlakeXx, LilcoperStretch
+  // Reject normal words/phrases like: hello, can i play, add me, bray bray.
+  const hasNumber = /[0-9]/.test(compact);
+  const hasSeparator = /[_.-]/.test(compact);
+  const hasMixedCase = /[a-z]/.test(compact) && /[A-Z]/.test(compact);
+  const hasAllCapsStyle = /^[A-Z0-9_.-]{4,}$/.test(compact) && /[A-Z]/.test(compact);
+  const hasXxStyle = /^x{1,2}[A-Za-z0-9_.-]{3,}x{1,2}$/i.test(compact);
+
+  // Spaces are risky. Only allow spaced bare messages if they also have a number,
+  // username punctuation, mixed caps, or match a known queue/saved name above.
+  if (words.length > 1 && !(hasNumber || hasSeparator || hasMixedCase || hasAllCapsStyle || hasXxStyle)) return '';
+
+  // Single all-lowercase words with no numbers/punctuation are usually normal chat.
+  // They can still join by typing !q name. Bare fallback should not guess these.
+  if (!(hasNumber || hasSeparator || hasMixedCase || hasAllCapsStyle || hasXxStyle)) return '';
+
+  const valid = validateName(text);
+  if (!valid.ok) return '';
+  return valid.name;
+}
 // ── Persistent user store ───────────────────────────────────────────────────
 
 function loadUsers() {
@@ -1119,10 +1196,12 @@ function registerTikTokEvents(entry) {
     // Pick up admin edits/deletes to saved TikTok names without restarting the bot.
     reloadUsersFromDisk();
 
-    const isCmd = lower === '!c' || lower === '!clear' || lower === '!r' || lower === '!reset' || JOIN_COMMAND_RE.test(msg);
+    const bareJoinName = getBareJoinName(msg, userKey);
+    const isBareJoin = Boolean(bareJoinName);
+    const isCmd = lower === '!c' || lower === '!clear' || lower === '!r' || lower === '!reset' || JOIN_COMMAND_RE.test(msg) || isBareJoin;
     if (!isCmd) return;
 
-    cmd(`[${sourceUsername}] command heard from @${display} / key=${userKey}: ${msg}`);
+    cmd(`[${sourceUsername}] ${isBareJoin ? 'bare name heard' : 'command heard'} from @${display} / key=${userKey}: ${msg}`);
 
     // Prevent duplicate handling if a connector emits both `chat` and `comment`
     // for the same message. Keeps one person from being queued twice.
@@ -1142,7 +1221,7 @@ function registerTikTokEvents(entry) {
     // Only rate-limit queue JOIN commands.
     // Do NOT let !r / !c consume the cooldown, because TikTok can deliver
     // messages in a burst. Example: !r followed immediately by !q name should work.
-    const isJoinCommand = JOIN_COMMAND_RE.test(msg);
+    const isJoinCommand = JOIN_COMMAND_RE.test(msg) || isBareJoin;
     const cooldownKey = `${userKey}:join`;
     if (isJoinCommand && isOnCooldown(cooldownKey)) {
       cmd(`[${sourceUsername}] [cooldown] @${tiktokId} — ignored join (${COOLDOWN_MS / 1000}s cooldown)`);
@@ -1220,10 +1299,10 @@ function registerTikTokEvents(entry) {
       return;
     }
 
-    if (!JOIN_COMMAND_RE.test(msg)) return;
+    if (!JOIN_COMMAND_RE.test(msg) && !isBareJoin) return;
     setCooldown(cooldownKey);
 
-    const afterCommand = msg.replace(JOIN_COMMAND_RE, '').trim();
+    const afterCommand = isBareJoin ? bareJoinName : msg.replace(JOIN_COMMAND_RE, '').trim();
     let record         = getRecord(users, userKey);
 
     await refreshLiveQueueFromServer();
