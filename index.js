@@ -195,7 +195,6 @@ function getBareJoinName(rawMsg, userKey = '') {
   if (/[?"'`~:;,#$%^&*()[\]{}=+\\|<>]/.test(text)) return '';
 
   const words = text.split(/\s+/).filter(Boolean);
-  if (words.length > 3) return '';
 
   const compact = text.replace(/\s+/g, '');
   if (compact.length < 3 || compact.length > 20) return '';
@@ -209,6 +208,25 @@ function getBareJoinName(rawMsg, userKey = '') {
   // another known saved name that is not taken by someone else, or a current queue slot.
   const known = looksLikeKnownPlayerName(compact, userKey);
   if (known) return known;
+
+  // Do not turn normal sentences into names. Example TikTok chat like
+  // "I got 975" used to compact into "Igot975" and pass because it had a number.
+  // Bare fallback should only guess short username-looking text, not phrases.
+  const naturalPhraseWords = new Set([
+    'i','im',"i\'m",'ive',"i\'ve",'id',"i\'d",'me','my','mine','we','us','you','your','yall',
+    'got','get','have','has','had','need','want','wanna','can','cant','cannot','could','would','should',
+    'am','are','is','was','were','be','been','being','do','does','did','done','go','going','play','playing',
+    'add','invite','join','queue','put','let','make','run','start','stop','wait','hold','ready',
+    'the','a','an','to','for','of','in','on','with','and','or','but','if','so','then','just','only',
+    'gg','lol','lmao','bro','bruh','nah','yes','no','ok','okay','hi','hey','hello','yo'
+  ]);
+  const normalizedWords = words.map((w) => normalizeForFilter(w));
+
+  // New bare names with 3+ words are too risky. Known/saved/queued matches already returned above.
+  if (words.length > 2) return '';
+
+  // If the message contains sentence words, ignore it as chat unless it matched a known player above.
+  if (words.length > 1 && normalizedWords.some((w) => naturalPhraseWords.has(w))) return '';
 
   // For new bare names, be MUCH stricter than !q mode so normal chat does not flood the queue.
   // Accept only if it has clear username signals:
