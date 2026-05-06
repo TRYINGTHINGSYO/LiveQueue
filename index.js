@@ -256,22 +256,41 @@ function getBareJoinName(rawMsg, userKey = '') {
   const hasAllCapsStyle = /^[A-Z0-9_.-]{4,}$/.test(compact) && /[A-Z]/.test(compact);
   const hasXxStyle = /^x{1,2}[A-Za-z0-9_.-]{3,}x{1,2}$/i.test(compact);
 
-  // Entropy / phrase-smash guard.
-  // "I got 975" compacts to "Igot975" which has a number and mixed case — but it's a sentence.
-  // Detect this by splitting the compact string on digit boundaries and checking if any
-  // alphabetic segment is itself a natural-language word. If the word-before-number is a
-  // common English word, this is almost certainly a phrase, not a username.
-  if (hasNumber) {
-    // Guard against phrase-smash: "I got 975" → compact "Igot975" has a number and mixed case
-    // but is a sentence. Split compact on digit boundaries; if any alpha segment is a common
-    // English word the whole thing is probably chat, not a username.
-    // Also check raw words (normalized) so multi-word inputs like ["I","got","975"] are caught.
+  // Phrase-smash guard: catch sentences typed as one token (no spaces) before we accept them.
+  // "Igot975"    → alpha segment "igot" → split into "i"+"got" → both phrase words → BLOCK
+  // "imready2"   → alpha segment "imready" → "im"+"ready" → both phrase words → BLOCK
+  // "addme1"     → alpha segment "addme" → "add"+"me" → both phrase words → BLOCK
+  // "braybray15" → alpha segment "braybray" → no split produces two phrase words → PASS
+  // "LilJr99"    → alpha segment "liljr" → no valid phrase-word split → PASS
+  //
+  // Algorithm: for each alpha segment, try every prefix/suffix split (min 1 char each).
+  // If ANY split produces two substrings that are both in naturalPhraseWords, it is a phrase.
+  // Also check raw words (multi-word input like ["I","got","975"]) for the spaced case.
+  if (hasNumber || words.length > 1) {
+    const rawWordNorms = words.map(w => normalizeForFilter(w));
+    // Direct word match (catches multi-word spaced phrases)
+    if (rawWordNorms.some(w => w.length > 0 && naturalPhraseWords.has(w))) return '';
+
+    // Segment split match (catches single-token smashed phrases)
     const alphaSegments = compact.split(/[0-9]+/).filter(Boolean).map(s => normalizeForFilter(s));
-    const rawWordNorms  = words.map(w => normalizeForFilter(w));
-    const phraseHit =
-      alphaSegments.some(seg => seg.length > 0 && naturalPhraseWords.has(seg)) ||
-      rawWordNorms.some(w  => w.length  > 0 && naturalPhraseWords.has(w));
-    if (phraseHit) return '';
+    for (const seg of alphaSegments) {
+      if (!seg) continue;
+      // Whole segment is a phrase word
+      if (naturalPhraseWords.has(seg)) return '';
+      // Try every 2-part prefix+suffix split
+      for (let cut = 1; cut < seg.length; cut++) {
+        const prefix = seg.slice(0, cut);
+        const suffix = seg.slice(cut);
+        if (naturalPhraseWords.has(prefix) && naturalPhraseWords.has(suffix)) return '';
+      }
+      // Try every 3-part split (catches "caniplay" → "can"+"i"+"play")
+      for (let c1 = 1; c1 < seg.length - 1; c1++) {
+        for (let c2 = c1 + 1; c2 < seg.length; c2++) {
+          const p1 = seg.slice(0, c1), p2 = seg.slice(c1, c2), p3 = seg.slice(c2);
+          if (naturalPhraseWords.has(p1) && naturalPhraseWords.has(p2) && naturalPhraseWords.has(p3)) return '';
+        }
+      }
+    }
   }
 
   // Spaces are risky. Only allow spaced bare messages if they also have a number,
