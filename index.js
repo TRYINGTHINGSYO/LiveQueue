@@ -106,6 +106,24 @@ let MAX_RETRY_MS   = Number(process.env.MAX_RETRY_MS || 120_000);
 const CONNECT_TIMEOUT_MS = Number(process.env.CONNECT_TIMEOUT_MS || 45_000);
 const LIVE_SCAN_MS       = Number(process.env.LIVE_SCAN_MS || 15_000);
 
+// ── Name normalizer (needed for blocklist init below) ───────────────────────
+// Full definition lives later next to the other name helpers; this copy is
+// identical and lets us use it during module-level initialisation.
+function normalizeForFilter(raw) {
+  return String(raw || '')
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[@$]/g, 'a')
+    .replace(/[!1|]/g, 'i')
+    .replace(/[0]/g, 'o')
+    .replace(/[3]/g, 'e')
+    .replace(/[4]/g, 'a')
+    .replace(/[5]/g, 's')
+    .replace(/[7]/g, 't')
+    .replace(/[^a-z0-9]/g, '');
+}
+
 // Optional blocklists — also overwritten by server config.
 let BANNED_TIKTOK_USERS = new Set(
   String(process.env.BANNED_TIKTOK_USERS || '')
@@ -388,21 +406,7 @@ function migrateUsersToGlobalKeys() {
 }
 
 // ── Name sanitiser and filters ──────────────────────────────────────────────
-
-function normalizeForFilter(raw) {
-  return String(raw || '')
-    .normalize('NFKD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .toLowerCase()
-    .replace(/[@$]/g, 'a')
-    .replace(/[!1|]/g, 'i')
-    .replace(/[0]/g, 'o')
-    .replace(/[3]/g, 'e')
-    .replace(/[4]/g, 'a')
-    .replace(/[5]/g, 's')
-    .replace(/[7]/g, 't')
-    .replace(/[^a-z0-9]/g, '');
-}
+// (normalizeForFilter is defined earlier so it can be used during init)
 
 const RESERVED_NAMES = new Set(['admin', 'owner', 'host', 'mod', 'moderator', 'null', 'undefined', 'everyone']);
 const BAD_NAME_PATTERNS = [
@@ -883,16 +887,19 @@ function findNameTakenByOther(name, tiktokId) {
   if (savedConflict) return savedConflict;
 
   const ownRecord = getRecord(users, tiktokId);
-  const ownKey = canonicalName(ownRecord.name);
 
   for (const p of [...liveQueue, ...livePlaying]) {
     if (!p.name) continue;
     const activeKey = canonicalName(p.name);
-    if (ownKey && activeKey === ownKey) continue;
 
-    // Important: if a name is already on the website queue but nobody owns it
-    // in tiktok-names.json, allow the person to claim that exact active slot.
-    // This fixes stale/manual queue slots showing as false “already taken”.
+    // Skip this person's own saved name - whether exact or near match.
+    // Without this, rejoining after TikTok strips !q can falsely report "already taken"
+    // because namesAreTooClose fires on their own queue slot before ownNameIsActive runs.
+    if (ownRecord.name && namesAreTooClose(p.name, ownRecord.name)) continue;
+
+    // If a name is already on the website queue but nobody owns it in
+    // tiktok-names.json, allow the person to claim that exact active slot.
+    // This fixes stale/manual queue slots showing as false "already taken".
     if (activeKey === key) continue;
 
     if (namesAreTooClose(name, p.name)) return p.name;
@@ -1342,10 +1349,17 @@ function registerTikTokEvents(entry) {
 
     if (ownNameIsActive(record)) {
       const pos = getPosition(record.name);
+      // Determine if the person tried a DIFFERENT name or their same/saved name
+      const triedName = isBareJoin ? bareJoinName : afterCommand;
+      const isSameName = !triedName || canonicalName(triedName) === canonicalName(record.name);
       if (isPlaying(record.name)) {
         respond(tiktokId, `${record.name} is currently playing.`, sourceUsername);
-      } else {
+      } else if (isSameName) {
+        // They re-typed their own name (or !q with no name) - clear "already in queue" message
         respond(tiktokId, `${record.name} is already in queue${pos ? ` at #${pos}` : ''}.`, sourceUsername);
+      } else {
+        // They tried a DIFFERENT name while already queued - tell them which name they're under
+        respond(tiktokId, `You are already in queue as ${record.name}${pos ? ` (#${pos})` : ''}. Ask admin to change it or use !r after leaving queue.`, sourceUsername);
       }
       cmd(`[${sourceUsername}] [!q] @${display} already active as ${record.name}`);
       return;
@@ -1387,7 +1401,7 @@ function registerTikTokEvents(entry) {
         await refreshLiveQueueFromServer();
         setRecord(users, userKey, { name: clean, queued: true });
         const pos = getPosition(clean) || '?';
-        respond(tiktokId, result === 'added' ? `${clean} added to queue! Position: #${pos}` : `${clean} is already in the queue.`, sourceUsername);
+        respond(tiktokId, result === 'added' ? `${clean} added to queue! Position: #${pos}` : `${clean} is already in queue at #${pos}.`, sourceUsername);
         ok(`[${sourceUsername}] [!q] @${display} → ${clean} ${result} (#${pos})`);
       } else {
         setRecord(users, userKey, { name: clean, queued: false });
@@ -1409,7 +1423,7 @@ function registerTikTokEvents(entry) {
         await refreshLiveQueueFromServer();
         setRecord(users, userKey, { name: record.name, queued: true });
         const pos = getPosition(record.name) || '?';
-        respond(tiktokId, result === 'added' ? `${record.name} rejoined the queue at #${pos}!` : `${record.name} is already in the queue.`, sourceUsername);
+        respond(tiktokId, result === 'added' ? `${record.name} rejoined the queue at #${pos}!` : `${record.name} is already in queue at #${pos}.`, sourceUsername);
         ok(`[${sourceUsername}] [!q] @${display} → ${record.name} ${result} (#${pos})`);
       } else {
         respond(tiktokId, `Could not rejoin queue as "${record.name}". Try again shortly.`, sourceUsername);
