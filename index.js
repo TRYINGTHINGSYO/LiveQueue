@@ -164,20 +164,26 @@ ${C.cyan}${C.bold}╔═══════════════════�
   Users : ${C.yellow}${DATA_FILE}${C.reset}
   Sync  : ${C.green}Admin panel config sync ENABLED${C.reset}
 
-  ${C.dim}Commands: !q <name>  •  plain name fallback  •  !q  •  !c  •  !r${C.reset}
+  ${C.dim}Commands: q/!q/queue/!queue <name>  •  q/!q/queue/!queue  •  c/!c/!clear  •  r/!r/!reset  •  bare-name fallback OFF${C.reset}
 `);
 }
 
 
 // Commands the bot should treat as queue joins.
-// Examples accepted: !q Blake, !Q Blake, !queue Blake, !join Blake, !play Blake, /q Blake, q Blake
-const JOIN_COMMAND_RE = /^(?:!q|!queue|!join|!play|\/q|q)(?:\s+|$)/i;
+// Allowed commands only:
+//   Join:  q Blake, !q Blake, queue Blake, !queue Blake
+//   Clear: c, !c, !clear
+//   Reset: r, !r, !reset
+// No join/play aliases and no plain clear/reset words.
+const JOIN_COMMAND_RE = /^(?:q|queue|!q|!queue)(?:\s+|$)/i;
+const CLEAR_COMMAND_RE = /^(?:c|!c|!clear)$/i;
+const RESET_COMMAND_RE = /^(?:r|!r|!reset)$/i;
 
 
-// TikTok sometimes strips or hides the !q part, so the bot may only receive the name.
-// Bare-name mode treats a clean username-looking chat message as a join attempt.
-// Set BARE_NAME_MODE=false in Railway if you ever want to disable this.
-let BARE_NAME_MODE = String(process.env.BARE_NAME_MODE || 'true').toLowerCase() !== 'false';
+// Bare-name mode is OFF by default so normal TikTok chat words do not get saved as Ubisoft names.
+// Users must type a command, preferably: q UbisoftName.
+// Set BARE_NAME_MODE=true only if you intentionally want plain-name fallback again.
+let BARE_NAME_MODE = String(process.env.BARE_NAME_MODE || 'false').toLowerCase() === 'true';
 const DEBUG_BARE_NAME = envBool(process.env.DEBUG_BARE_NAME, false);
 const BARE_NAME_BLOCKLIST = new Set([
   'hi','hey','hello','yo','yes','no','ok','okay','lol','lmao','bro','bruh','nah','nahh','nahhh',
@@ -190,7 +196,7 @@ function looksLikeKnownPlayerName(candidate, userKey = '') {
   if (!clean) return '';
 
   // Own saved name is always safe. This lets someone type only their saved name
-  // when TikTok strips the !q part.
+  // when a viewer uses q without extra punctuation.
   const ownRecord = getRecord(users, userKey);
   if (ownRecord.name && namesAreTooClose(clean, ownRecord.name)) return ownRecord.name;
 
@@ -268,7 +274,7 @@ function getBareJoinName(rawMsg, userKey = '') {
     return block('multi-word sentence word detected');
   }
 
-  // For new bare names, be MUCH stricter than !q mode so normal chat does not flood the queue.
+  // For new bare names, be MUCH stricter than command mode so normal chat does not flood the queue.
   // Accept only if it has clear username signals:
   //   braybray15, bray bray15, kouncil.b0t, SIMZER-_-, xXBlakeXx, LilcoperStretch
   // Reject normal words/phrases like: hello, can i play, add me, bray bray, I got 975.
@@ -323,7 +329,7 @@ function getBareJoinName(rawMsg, userKey = '') {
   }
 
   // Single all-lowercase words with no numbers/punctuation are usually normal chat.
-  // They can still join by typing !q name. Bare fallback should not guess these.
+  // They can still join by typing q name, !q name, queue name, or !queue name. Bare fallback should not guess these.
   if (!(hasNumber || hasSeparator || hasMixedCase || hasAllCapsStyle || hasXxStyle)) {
     return block('missing username signal');
   }
@@ -408,7 +414,7 @@ function getRecord(users, userKey) {
 function setRecord(users, userKey, record) {
   users[userKey] = { name: record.name || '', queued: Boolean(record.queued) };
   saveUsers(users);
-  // Keep the admin panel's TikTok Saved Names list current after !q, !c, or !r.
+  // Keep the admin panel's TikTok Saved Names list current after q/!q/queue/!queue, c/!c/!clear, or r/!r/!reset.
   setTimeout(() => {
     try { postBotStatusToServer().catch(() => {}); } catch (_) {}
   }, 0);
@@ -514,13 +520,13 @@ const BAD_NAME_PATTERNS = [
 
 function validateName(rawName) {
   const raw = String(rawName || '').trim();
-  if (!raw) return { ok: false, reason: 'Type one name after !q. Example: !q Blake' };
+  if (!raw) return { ok: false, reason: 'Type one name after q. Example: q Blake' };
 
   // Be forgiving for TikTok chat typos.
   // People often type Ubisoft names with accidental spaces: "bray bray15", "Lilcoper Stretch", "xX Blake Xx".
   // Ubisoft-style queue names cannot contain spaces, so collapse spaces instead of ignoring the command.
   const compact = raw.replace(/\s+/g, '');
-  if (!compact) return { ok: false, reason: 'Type one name after !q. Example: !q Blake' };
+  if (!compact) return { ok: false, reason: 'Type one name after q. Example: q Blake' };
 
   const clean = compact.replace(/[^a-zA-Z0-9_.-]/g, '').slice(0, 20);
   if (clean.length < 3) return { ok: false, reason: 'Name must be at least 3 characters.' };
@@ -1000,7 +1006,7 @@ function findNameTakenByOther(name, tiktokId) {
     const activeKey = canonicalName(p.name);
 
     // Skip this person's own saved name - whether exact or near match.
-    // Without this, rejoining after TikTok strips !q can falsely report "already taken"
+    // Without this, rejoining by command can falsely report "already taken"
     // because namesAreTooClose fires on their own queue slot before ownNameIsActive runs.
     if (ownRecord.name && namesAreTooClose(p.name, ownRecord.name)) continue;
 
@@ -1316,7 +1322,7 @@ function registerTikTokEvents(entry) {
 
   // Some TikTok Live connector versions/accounts emit comments as `chat`;
   // others emit them as `comment`. Register BOTH for every stream so the
-  // second live, like @barbariandino, can also use !q / !c / !r.
+  // second live, like @barbariandino, can also use q/!q/queue/!queue, c/!c/!clear, and r/!r/!reset.
   const handleChatCommand = async (data, eventName = 'chat') => {
     const rawTikTokId = normalizeTikTokUsername(data?.uniqueId || data?.user?.uniqueId || data?.userId || data?.user?.id || '');
     const tiktokId = rawTikTokId;
@@ -1330,7 +1336,7 @@ function registerTikTokEvents(entry) {
 
     const bareJoinName = getBareJoinName(msg, userKey);
     const isBareJoin = Boolean(bareJoinName);
-    const isCmd = lower === '!c' || lower === '!clear' || lower === '!r' || lower === '!reset' || JOIN_COMMAND_RE.test(msg) || isBareJoin;
+    const isCmd = CLEAR_COMMAND_RE.test(msg) || RESET_COMMAND_RE.test(msg) || JOIN_COMMAND_RE.test(msg) || isBareJoin;
     if (!isCmd) return;
 
     cmd(`[${sourceUsername}] ${isBareJoin ? 'bare name heard' : 'command heard'} from @${display} / key=${userKey}: ${msg}`);
@@ -1351,8 +1357,8 @@ function registerTikTokEvents(entry) {
     }
 
     // Only rate-limit queue JOIN commands.
-    // Do NOT let !r / !c consume the cooldown, because TikTok can deliver
-    // messages in a burst. Example: !r followed immediately by !q name should work.
+    // Do NOT let r/!r or c/!c consume the cooldown, because TikTok can deliver
+    // messages in a burst. Example: r followed immediately by q name should work.
     const isJoinCommand = JOIN_COMMAND_RE.test(msg) || isBareJoin;
     const cooldownKey = `${userKey}:join`;
     if (isJoinCommand && isOnCooldown(cooldownKey)) {
@@ -1361,11 +1367,11 @@ function registerTikTokEvents(entry) {
     }
 
 
-    if (lower === '!c' || lower === '!clear') {
+    if (CLEAR_COMMAND_RE.test(msg)) {
       const record = getRecord(users, userKey);
       if (!record.name) {
-        respond(tiktokId, 'You have no saved name. Use !q <YourName> to join the queue.', sourceUsername);
-        cmd(`[${sourceUsername}] [!c] @${display} — no saved name`);
+        respond(tiktokId, 'You have no saved name. Use q <YourName> to join the queue.', sourceUsername);
+        cmd(`[${sourceUsername}] [c] @${display} — no saved name`);
         return;
       }
 
@@ -1373,38 +1379,38 @@ function registerTikTokEvents(entry) {
 
       if (isPlaying(record.name)) {
         respond(tiktokId, `${record.name} is currently playing. Ask the host to clear playing when the match is done.`, sourceUsername);
-        cmd(`[${sourceUsername}] [!c] @${display} blocked while playing as ${record.name}`);
+        cmd(`[${sourceUsername}] [c] @${display} blocked while playing as ${record.name}`);
         return;
       }
 
       if (!isInQueue(record.name)) {
         setRecord(users, userKey, { name: record.name, queued: false });
-        respond(tiktokId, `${record.name} is not in the queue. Your saved name is still set. Use !q to rejoin or !r to reset it.`, sourceUsername);
-        cmd(`[${sourceUsername}] [!c] @${display} (${record.name}) — not in queue`);
+        respond(tiktokId, `${record.name} is not in the queue. Your saved name is still set. Use q to rejoin or r to reset it.`, sourceUsername);
+        cmd(`[${sourceUsername}] [c] @${display} (${record.name}) — not in queue`);
         return;
       }
 
       const result = await removeFromQueue(record.name);
       if (result === 'removed') {
         setRecord(users, userKey, { name: record.name, queued: false });
-        respond(tiktokId, `${record.name} cleared from the queue. Saved name kept. Type !q to rejoin or !r to reset your name.`, sourceUsername);
-        ok(`[${sourceUsername}] [!c] @${display} removed ${record.name} from queue`);
+        respond(tiktokId, `${record.name} cleared from the queue. Saved name kept. Type q to rejoin or r to reset your name.`, sourceUsername);
+        ok(`[${sourceUsername}] [c] @${display} removed ${record.name} from queue`);
       } else if (result === 'not_found') {
         setRecord(users, userKey, { name: record.name, queued: false });
         respond(tiktokId, `${record.name} was not detected in the queue, so there was nothing to clear. Saved name kept.`, sourceUsername);
-        cmd(`[${sourceUsername}] [!c] @${display} ${record.name} not detected in queue`);
+        cmd(`[${sourceUsername}] [c] @${display} ${record.name} not detected in queue`);
       } else {
         respond(tiktokId, `Could not clear ${record.name} from the queue. Ask the host to remove it.`, sourceUsername);
-        err(`[${sourceUsername}] [!c] @${display} failed to remove ${record.name}`);
+        err(`[${sourceUsername}] [c] @${display} failed to remove ${record.name}`);
       }
       return;
     }
 
-    if (lower === '!r' || lower === '!reset') {
+    if (RESET_COMMAND_RE.test(msg)) {
       const record = getRecord(users, userKey);
       if (!record.name) {
-        respond(tiktokId, 'You have no saved name to reset. Use !q <YourName> to set one.', sourceUsername);
-        cmd(`[${sourceUsername}] [!r] @${display} — no saved name`);
+        respond(tiktokId, 'You have no saved name to reset. Use q <YourName> to set one.', sourceUsername);
+        cmd(`[${sourceUsername}] [r] @${display} — no saved name`);
         return;
       }
 
@@ -1412,13 +1418,13 @@ function registerTikTokEvents(entry) {
 
       if (isPlaying(record.name)) {
         respond(tiktokId, `${record.name} is currently playing. Ask the host to clear playing before resetting your name.`, sourceUsername);
-        cmd(`[${sourceUsername}] [!r] @${display} blocked while playing as ${record.name}`);
+        cmd(`[${sourceUsername}] [r] @${display} blocked while playing as ${record.name}`);
         return;
       }
 
       if (isInQueue(record.name)) {
-        respond(tiktokId, `${record.name} is still in the queue. Use !c first, then use !r to reset your saved name.`, sourceUsername);
-        cmd(`[${sourceUsername}] [!r] @${display} blocked reset while queued as ${record.name}`);
+        respond(tiktokId, `${record.name} is still in the queue. Use c first, then r to reset your saved name.`, sourceUsername);
+        cmd(`[${sourceUsername}] [r] @${display} blocked reset while queued as ${record.name}`);
         return;
       }
 
@@ -1426,8 +1432,8 @@ function registerTikTokEvents(entry) {
       delete users[userKey];
       saveUsers(users);
       setTimeout(() => { try { postBotStatusToServer().catch(() => {}); } catch (_) {} }, 0);
-      respond(tiktokId, `Reset saved name "${old}". Use !q <NewUbisoftName> to set a new one.`, sourceUsername);
-      cmd(`[${sourceUsername}] [!r] @${display} reset "${old}"`);
+      respond(tiktokId, `Reset saved name "${old}". Use q <NewUbisoftName> to set a new one.`, sourceUsername);
+      cmd(`[${sourceUsername}] [r] @${display} reset "${old}"`);
       return;
     }
 
@@ -1462,13 +1468,13 @@ function registerTikTokEvents(entry) {
       if (isPlaying(record.name)) {
         respond(tiktokId, `${record.name} is currently playing.`, sourceUsername);
       } else if (isSameName) {
-        // They re-typed their own name (or !q with no name) - clear "already in queue" message
+        // They re-typed their own name (or q with no name) - clear "already in queue" message
         respond(tiktokId, `${record.name} is already in queue${pos ? ` at #${pos}` : ''}.`, sourceUsername);
       } else {
         // They tried a DIFFERENT name while already queued - tell them which name they're under
-        respond(tiktokId, `You are already in queue as ${record.name}${pos ? ` (#${pos})` : ''}. Ask admin to change it or use !r after leaving queue.`, sourceUsername);
+        respond(tiktokId, `You are already in queue as ${record.name}${pos ? ` (#${pos})` : ''}. Ask admin to change it or use r after leaving queue.`, sourceUsername);
       }
-      cmd(`[${sourceUsername}] [!q] @${display} already active as ${record.name}`);
+      cmd(`[${sourceUsername}] [q] @${display} already active as ${record.name}`);
       return;
     }
 
@@ -1476,44 +1482,44 @@ function registerTikTokEvents(entry) {
       const valid = validateName(afterCommand);
       if (!valid.ok) {
         respond(tiktokId, valid.reason, sourceUsername);
-        cmd(`[${sourceUsername}] [!q] @${display} invalid name: "${afterCommand}" (${valid.reason})`);
+        cmd(`[${sourceUsername}] [q] @${display} invalid name: "${afterCommand}" (${valid.reason})`);
         return;
       }
       let clean = valid.name;
       const knownName = findKnownNameForInput(clean, userKey);
       if (knownName) {
-        if (knownName !== clean) cmd(`[${sourceUsername}] [!q] @${display} normalized ${clean} → ${knownName}`);
+        if (knownName !== clean) cmd(`[${sourceUsername}] [q] @${display} normalized ${clean} → ${knownName}`);
         clean = knownName;
       }
 
-      // Saved Ubisoft names are permanent until !r.
-      // If they already have a saved name, !q <different name> will NOT change the file.
-      // They must use !r first, then !q <new name>.
+      // Saved Ubisoft names are permanent until r.
+      // If they already have a saved name, q <different name> will NOT change the file.
+      // They must use r first, then q <new name>.
       if (record.name && record.name.toLowerCase() !== clean.toLowerCase()) {
-        respond(tiktokId, `Your saved Ubisoft name is ${record.name}. Type !q to join with it, or use !r first if you need to change it.`, sourceUsername);
-        cmd(`[${sourceUsername}] [!q] @${display} tried to change ${record.name} → ${clean} without !r`);
+        respond(tiktokId, `Your saved Ubisoft name is ${record.name}. Type q to join with it, or use r first if you need to change it.`, sourceUsername);
+        cmd(`[${sourceUsername}] [q] @${display} tried to change ${record.name} → ${clean} without r`);
         return;
       }
 
       const takenMsg = nameTakenMessage(clean, userKey);
       if (takenMsg) {
         respond(tiktokId, takenMsg, sourceUsername);
-        cmd(`[${sourceUsername}] [!q] @${display} ✗ name "${clean}" blocked by name checker`);
+        cmd(`[${sourceUsername}] [q] @${display} ✗ name "${clean}" blocked by name checker`);
         return;
       }
-      setRecord(users, userKey, { name: clean, queued: false });
-      cmd(`[${sourceUsername}] [!q] @${display} saved name: ${clean}`);
       const result = await addToQueue(clean);
       if (result === 'added' || result === 'already') {
         await refreshLiveQueueFromServer();
         setRecord(users, userKey, { name: clean, queued: true });
+        cmd(`[${sourceUsername}] [q] @${display} saved name after server accepted it: ${clean}`);
         const pos = getPosition(clean) || '?';
         respond(tiktokId, result === 'added' ? `${clean} added to queue! Position: #${pos}` : `${clean} is already in queue at #${pos}.`, sourceUsername);
-        ok(`[${sourceUsername}] [!q] @${display} → ${clean} ${result} (#${pos})`);
+        ok(`[${sourceUsername}] [q] @${display} → ${clean} ${result} (#${pos})`);
       } else {
-        setRecord(users, userKey, { name: clean, queued: false });
-        respond(tiktokId, `Could not add "${clean}" to the queue. Try again shortly.`, sourceUsername);
-        err(`[${sourceUsername}] [!q] @${display} → could not add ${clean}`);
+        // Important: do NOT save the TikTok → Ubisoft name if the website queue rejected it.
+        // This stops random TikTok chat words/bad names from getting stuck on the account.
+        respond(tiktokId, `Could not add "${clean}" to the queue. Check the name and try: q YourUbisoftName`, sourceUsername);
+        err(`[${sourceUsername}] [q] @${display} → server rejected ${clean}; not saving it`);
       }
       return;
     }
@@ -1521,8 +1527,8 @@ function registerTikTokEvents(entry) {
     if (record.name) {
       const takenMsg = nameTakenMessage(record.name, userKey);
       if (takenMsg) {
-        respond(tiktokId, `${takenMsg} Use !r to reset your saved name after the host removes the old slot.`, sourceUsername);
-        cmd(`[${sourceUsername}] [!q] @${display} ✗ saved name "${record.name}" blocked by name checker`);
+        respond(tiktokId, `${takenMsg} Use r to reset your saved name after the host removes the old slot.`, sourceUsername);
+        cmd(`[${sourceUsername}] [q] @${display} ✗ saved name "${record.name}" blocked by name checker`);
         return;
       }
       const result = await addToQueue(record.name);
@@ -1531,16 +1537,16 @@ function registerTikTokEvents(entry) {
         setRecord(users, userKey, { name: record.name, queued: true });
         const pos = getPosition(record.name) || '?';
         respond(tiktokId, result === 'added' ? `${record.name} rejoined the queue at #${pos}!` : `${record.name} is already in queue at #${pos}.`, sourceUsername);
-        ok(`[${sourceUsername}] [!q] @${display} → ${record.name} ${result} (#${pos})`);
+        ok(`[${sourceUsername}] [q] @${display} → ${record.name} ${result} (#${pos})`);
       } else {
         respond(tiktokId, `Could not rejoin queue as "${record.name}". Try again shortly.`, sourceUsername);
-        err(`[${sourceUsername}] [!q] @${display} → could not add ${record.name}`);
+        err(`[${sourceUsername}] [q] @${display} → could not add ${record.name}`);
       }
       return;
     }
 
-    respond(tiktokId, 'No saved name! Type !q <YourUbisoftName> to join the queue.', sourceUsername);
-    cmd(`[${sourceUsername}] [!q] @${display} — no saved name`);
+    respond(tiktokId, 'No saved name! Type q <YourUbisoftName> to join the queue.', sourceUsername);
+    cmd(`[${sourceUsername}] [q] @${display} — no saved name`);
   };
 
   tiktok.on('chat', data => handleChatCommand(data, 'chat'));
@@ -1565,7 +1571,7 @@ function registerTikTokEvents(entry) {
   });
 
   // Viewer count updates only. Do NOT queue anyone from roomUser/join events.
-  // The bot only adds a player when that TikTok user types !q in chat.
+  // The bot only adds a player when that TikTok user types q in chat.
   tiktok.on('roomUser', d => {
     if (d?.viewerCount != null) {
       entry.currentViewers = Number(d.viewerCount);
