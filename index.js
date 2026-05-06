@@ -335,22 +335,40 @@ function getBareJoinName(rawMsg, userKey = '') {
 
 // ── Persistent user store ───────────────────────────────────────────────────
 
+function normalizeUsersObject(raw) {
+  if (Array.isArray(raw)) {
+    const out = {};
+    for (const item of raw) {
+      const key = normalizeTikTokUsername(displayUserKey(item?.tiktok || item?.tiktokId || item?.username || item?.user || item?.key || ''));
+      const name = String(item?.name || item?.ubisoft || item?.ubisoftName || '').trim();
+      if (!key || !name) continue;
+      out[key] = { ...(item && typeof item === 'object' ? item : {}), name };
+    }
+    return out;
+  }
+  return raw && typeof raw === 'object' ? raw : {};
+}
+
 function loadUsers() {
   try {
-    if (fs.existsSync(DATA_FILE)) return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    if (fs.existsSync(DATA_FILE)) return normalizeUsersObject(JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')));
   } catch (e) { err('Could not load users.json:', e.message); }
   return {};
 }
 
 function saveUsers(users) {
   try {
-    const dir = require('path').dirname(DATA_FILE);
-    fs.mkdirSync(dir, { recursive: true });
-    const tmp = DATA_FILE + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(users, null, 2), 'utf8');
-    fs.renameSync(tmp, DATA_FILE);
-  }
-  catch (e) { err('Could not save users.json:', e.message); }
+    // Merge with the current disk copy first so a stale in-memory bot cannot erase
+    // admin edits that happened through /api/admin/bot-users/update.
+    let disk = {};
+    if (fs.existsSync(DATA_FILE)) {
+      try { disk = normalizeUsersObject(JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'))); }
+      catch (_) { disk = {}; }
+    }
+    const merged = { ...disk, ...(users && typeof users === 'object' ? users : {}) };
+    fs.writeFileSync(DATA_FILE, JSON.stringify(merged, null, 2));
+    replaceUsersInMemory(merged);
+  } catch (e) { err('Could not save users.json:', e.message); }
 }
 
 
@@ -388,9 +406,6 @@ function getRecord(users, userKey) {
 }
 
 function setRecord(users, userKey, record) {
-  // Important: the admin panel can edit /data/tiktok-names.json directly.
-  // Reload first so one bot save does not overwrite a just-saved admin change.
-  reloadUsersFromDisk();
   users[userKey] = { name: record.name || '', queued: Boolean(record.queued) };
   saveUsers(users);
   // Keep the admin panel's TikTok Saved Names list current after !q, !c, or !r.
@@ -856,8 +871,6 @@ function getSavedUsersForAdmin() {
  */
 async function postBotStatusToServer(extra = {}) {
   if (!ADMIN_PASSWORD) return;
-  // Keep bot status from reporting stale saved names after admin edits.
-  reloadUsersFromDisk();
   const knownUsers = Object.keys(users).length;
   const queuedRecords = Object.values(users).filter(r => r?.queued).length;
   const savedUsers = getSavedUsersForAdmin();
@@ -1410,7 +1423,6 @@ function registerTikTokEvents(entry) {
       }
 
       const old = record.name;
-      reloadUsersFromDisk();
       delete users[userKey];
       saveUsers(users);
       setTimeout(() => { try { postBotStatusToServer().catch(() => {}); } catch (_) {} }, 0);
@@ -1434,7 +1446,6 @@ function registerTikTokEvents(entry) {
       const aliasKey = normalizeTikTokUsername(display);
       const aliasRecord = aliasKey && aliasKey !== userKey ? getRecord(users, aliasKey) : { name: '', queued: false };
       if (aliasRecord.name && canonicalName(aliasRecord.name) === canonicalName(afterCommand)) {
-        reloadUsersFromDisk();
         users[userKey] = aliasRecord;
         delete users[aliasKey];
         saveUsers(users);
@@ -1572,7 +1583,6 @@ rebuildTikTokConnections();
 
 function shutdown(signal) {
   warn(`\nReceived ${signal} — saving state and exiting…`);
-  reloadUsersFromDisk();
   saveUsers(users);
   for (const entry of streams.values()) { try { entry.conn.disconnect(); } catch (_) {} }
   postBotStatusToServer({ connected: false, connecting: false, error: `Shutdown: ${signal}` })
