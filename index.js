@@ -150,6 +150,11 @@ ${C.cyan}${C.bold}╔═══════════════════�
 `);
 }
 
+
+// Commands the bot should treat as queue joins.
+// Examples accepted: !q Blake, !Q Blake, !queue Blake, !join Blake, !play Blake, /q Blake, q Blake
+const JOIN_COMMAND_RE = /^(?:!q|!queue|!join|!play|\/q|q)(?:\s+|$)/i;
+
 // ── Persistent user store ───────────────────────────────────────────────────
 
 function loadUsers() {
@@ -722,19 +727,54 @@ function getPosition(name) {
 function ownNameIsActive(record) {
   return Boolean(record.name) && (record.queued || isInQueue(record.name) || isPlaying(record.name));
 }
+function recordFromValue(value) {
+  if (!value) return { name: '', queued: false };
+  if (typeof value === 'string') return { name: value, queued: false };
+  return { name: value.name || '', queued: Boolean(value.queued) };
+}
+
+function findSavedNameTakenByOther(name, tiktokId) {
+  const key = canonicalName(name);
+  const ownKey = normalizeTikTokUsername(displayUserKey(tiktokId));
+  if (!key) return null;
+
+  for (const [rawOwner, value] of Object.entries(users)) {
+    const ownerKey = normalizeTikTokUsername(displayUserKey(rawOwner));
+    if (!ownerKey || ownerKey === ownKey) continue;
+
+    const rec = recordFromValue(value);
+    if (!rec.name) continue;
+
+    // Exact same saved Ubisoft name belongs to a different TikTok account.
+    if (canonicalName(rec.name) === key) return rec.name;
+
+    // Also block obvious copycat versions of another saved Ubisoft name.
+    if (namesAreTooClose(name, rec.name)) return rec.name;
+  }
+
+  return null;
+}
+
 function findNameTakenByOther(name, tiktokId) {
   const key = canonicalName(name);
   if (!key) return null;
 
-  // Only block names that are actually active on the website right now.
-  // Saved TikTok names in users.json are NOT treated as active queue slots,
-  // because that caused false “name is taken” errors after a person left queue.
+  const savedConflict = findSavedNameTakenByOther(name, tiktokId);
+  if (savedConflict) return savedConflict;
+
   const ownRecord = getRecord(users, tiktokId);
   const ownKey = canonicalName(ownRecord.name);
 
   for (const p of [...liveQueue, ...livePlaying]) {
     if (!p.name) continue;
-    if (ownKey && canonicalName(p.name) === ownKey) continue;
+    const activeKey = canonicalName(p.name);
+    if (ownKey && activeKey === ownKey) continue;
+
+    // Important: if a name is already on the website queue but nobody owns it
+    // in tiktok-names.json, allow the person to claim that exact active slot.
+    // This fixes stale/manual queue slots showing as false “already taken”.
+    if (activeKey === key) continue;
+
     if (namesAreTooClose(name, p.name)) return p.name;
   }
 
@@ -1054,7 +1094,7 @@ function registerTikTokEvents(entry) {
     // Pick up admin edits/deletes to saved TikTok names without restarting the bot.
     reloadUsersFromDisk();
 
-    const isCmd = lower === '!c' || lower === '!clear' || lower === '!r' || lower === '!reset' || lower.startsWith('!q');
+    const isCmd = lower === '!c' || lower === '!clear' || lower === '!r' || lower === '!reset' || JOIN_COMMAND_RE.test(msg);
     if (!isCmd) return;
 
     cmd(`[${sourceUsername}] command heard from @${display} / key=${userKey}: ${msg}`);
@@ -1077,7 +1117,7 @@ function registerTikTokEvents(entry) {
     // Only rate-limit queue JOIN commands.
     // Do NOT let !r / !c consume the cooldown, because TikTok can deliver
     // messages in a burst. Example: !r followed immediately by !q name should work.
-    const isJoinCommand = lower.startsWith('!q');
+    const isJoinCommand = JOIN_COMMAND_RE.test(msg);
     const cooldownKey = `${userKey}:join`;
     if (isJoinCommand && isOnCooldown(cooldownKey)) {
       cmd(`[${sourceUsername}] [cooldown] @${tiktokId} — ignored join (${COOLDOWN_MS / 1000}s cooldown)`);
@@ -1155,13 +1195,28 @@ function registerTikTokEvents(entry) {
       return;
     }
 
-    if (!lower.startsWith('!q')) return;
+    if (!JOIN_COMMAND_RE.test(msg)) return;
     setCooldown(cooldownKey);
 
-    const afterCommand = msg.replace(/^!q(?:ueue)?/i, '').trim();
-    const record       = getRecord(users, userKey);
+    const afterCommand = msg.replace(JOIN_COMMAND_RE, '').trim();
+    let record         = getRecord(users, userKey);
 
     await refreshLiveQueueFromServer();
+
+    // If older bot versions saved somebody under their TikTok display name
+    // instead of their stable @uniqueId, move that record to the stable key.
+    // Example from logs: display @tate, stable key buckismain.
+    if (!record.name && afterCommand) {
+      const aliasKey = normalizeTikTokUsername(display);
+      const aliasRecord = aliasKey && aliasKey !== userKey ? getRecord(users, aliasKey) : { name: '', queued: false };
+      if (aliasRecord.name && canonicalName(aliasRecord.name) === canonicalName(afterCommand)) {
+        users[userKey] = aliasRecord;
+        delete users[aliasKey];
+        saveUsers(users);
+        record = aliasRecord;
+        cmd(`[${sourceUsername}] [sync] moved saved name ${aliasRecord.name} from @${aliasKey} to @${userKey}`);
+      }
+    }
 
     if (ownNameIsActive(record)) {
       const pos    = getPosition(record.name);
