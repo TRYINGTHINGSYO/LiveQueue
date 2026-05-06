@@ -177,7 +177,7 @@ const JOIN_COMMAND_RE = /^(?:!q|!queue|!join|!play|\/q|q)(?:\s+|$)/i;
 // TikTok sometimes strips or hides the !q part, so the bot may only receive the name.
 // Bare-name mode treats a clean username-looking chat message as a join attempt.
 // Set BARE_NAME_MODE=false in Railway if you ever want to disable this.
-const BARE_NAME_MODE = String(process.env.BARE_NAME_MODE || 'true').toLowerCase() !== 'false';
+let BARE_NAME_MODE = String(process.env.BARE_NAME_MODE || 'true').toLowerCase() !== 'false';
 const BARE_NAME_BLOCKLIST = new Set([
   'hi','hey','hello','yo','yes','no','ok','okay','lol','lmao','bro','bruh','nah','nahh','nahhh',
   'ready','start','stop','queue','join','play','game','ranked','custom','customs','siege','rainbow',
@@ -249,12 +249,30 @@ function getBareJoinName(rawMsg, userKey = '') {
   // For new bare names, be MUCH stricter than !q mode so normal chat does not flood the queue.
   // Accept only if it has clear username signals:
   //   braybray15, bray bray15, kouncil.b0t, SIMZER-_-, xXBlakeXx, LilcoperStretch
-  // Reject normal words/phrases like: hello, can i play, add me, bray bray.
+  // Reject normal words/phrases like: hello, can i play, add me, bray bray, I got 975.
   const hasNumber = /[0-9]/.test(compact);
   const hasSeparator = /[_.-]/.test(compact);
   const hasMixedCase = /[a-z]/.test(compact) && /[A-Z]/.test(compact);
   const hasAllCapsStyle = /^[A-Z0-9_.-]{4,}$/.test(compact) && /[A-Z]/.test(compact);
   const hasXxStyle = /^x{1,2}[A-Za-z0-9_.-]{3,}x{1,2}$/i.test(compact);
+
+  // Entropy / phrase-smash guard.
+  // "I got 975" compacts to "Igot975" which has a number and mixed case — but it's a sentence.
+  // Detect this by splitting the compact string on digit boundaries and checking if any
+  // alphabetic segment is itself a natural-language word. If the word-before-number is a
+  // common English word, this is almost certainly a phrase, not a username.
+  if (hasNumber) {
+    // Guard against phrase-smash: "I got 975" → compact "Igot975" has a number and mixed case
+    // but is a sentence. Split compact on digit boundaries; if any alpha segment is a common
+    // English word the whole thing is probably chat, not a username.
+    // Also check raw words (normalized) so multi-word inputs like ["I","got","975"] are caught.
+    const alphaSegments = compact.split(/[0-9]+/).filter(Boolean).map(s => normalizeForFilter(s));
+    const rawWordNorms  = words.map(w => normalizeForFilter(w));
+    const phraseHit =
+      alphaSegments.some(seg => seg.length > 0 && naturalPhraseWords.has(seg)) ||
+      rawWordNorms.some(w  => w.length  > 0 && naturalPhraseWords.has(w));
+    if (phraseHit) return '';
+  }
 
   // Spaces are risky. Only allow spaced bare messages if they also have a number,
   // username punctuation, mixed caps, or match a known queue/saved name above.
@@ -374,14 +392,23 @@ function namesAreTooClose(candidate, existing) {
   if (a === b) return true;
 
   const minLen = Math.min(a.length, b.length);
-  const allowedDistance = minLen >= 8 ? 2 : 1;
-  if (minLen >= 4 && (a.includes(b) || b.includes(a))) return true;
-  if (minLen >= 5 && boundedEditDistance(a, b, allowedDistance) <= allowedDistance) return true;
+
+  // Tightened thresholds to reduce false "name taken" blocks on real different players.
+  // Edit distance 2 only for long names (10+ chars). Distance 1 for medium (7-9).
+  // Short names (<=6 chars like "Blake", "Scott") only match on exact canonical or skeleton — no fuzzy.
+  const allowedDistance = minLen >= 10 ? 2 : minLen >= 7 ? 1 : 0;
+
+  // Substring inclusion: require both sides to be at least 6 chars so short words
+  // like "bray" don't accidentally swallow "braybray15".
+  if (minLen >= 6 && (a.includes(b) || b.includes(a))) return true;
+
+  // Fuzzy edit distance (skip when allowedDistance === 0 to avoid short-name false positives)
+  if (allowedDistance > 0 && boundedEditDistance(a, b, allowedDistance) <= allowedDistance) return true;
 
   const sa = nameSkeleton(candidate);
   const sb = nameSkeleton(existing);
   if (sa === sb) return true;
-  if (minLen >= 5 && boundedEditDistance(sa, sb, allowedDistance) <= allowedDistance) return true;
+  if (allowedDistance > 0 && boundedEditDistance(sa, sb, allowedDistance) <= allowedDistance) return true;
 
   return false;
 }
@@ -664,6 +691,15 @@ async function fetchBotConfigFromServer() {
     }
     if (Number.isFinite(cfg.maxRetryMs) && cfg.maxRetryMs >= 5_000) {
       MAX_RETRY_MS = cfg.maxRetryMs;
+    }
+
+    // Bare-name fallback toggle — can be flipped live from admin panel
+    if (cfg.bareNameMode !== undefined && cfg.bareNameMode !== null) {
+      const next = cfgBool(cfg.bareNameMode, BARE_NAME_MODE);
+      if (next !== BARE_NAME_MODE) {
+        info(`[sync] bareNameMode updated: ${BARE_NAME_MODE} → ${next}`);
+        BARE_NAME_MODE = next;
+      }
     }
 
     // Banned users
