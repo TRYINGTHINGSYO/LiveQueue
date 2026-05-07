@@ -877,6 +877,18 @@ function getSavedUsersForAdmin() {
 /**
  * Post the bot's current live status to the server.
  */
+
+async function postAdminLog(type, category, message, meta = {}) {
+  if (!ADMIN_PASSWORD) return;
+  try {
+    await fetchWithTimeout(`${BASE_URL}/api/bot/log`, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({ type, category, message, meta }),
+    }, 4_000);
+  } catch (_) { /* log posting is non-critical */ }
+}
+
 async function postBotStatusToServer(extra = {}) {
   if (!ADMIN_PASSWORD) return;
   const knownUsers = Object.keys(users).length;
@@ -1220,6 +1232,7 @@ function connectTikTok(username) {
   entry.connectTimeout = setTimeout(() => {
     if (!entry.connected) {
       warn(`TikTok connect timed out for @${entry.username}. Keeping it armed and trying again.`);
+      postAdminLog('warn', 'tiktok', `TikTok connect timed out for @${entry.username}. Retrying.`);
       entry.connecting = false;
       entry.connected = false;
       try { if (entry.conn) entry.conn.disconnect(); } catch (_) {}
@@ -1230,6 +1243,7 @@ function connectTikTok(username) {
   }, CONNECT_TIMEOUT_MS);
 
   info(`Connecting to @${entry.username}…`);
+  postAdminLog('info', 'tiktok', `Connecting to @${entry.username}`);
   updateAggregateBotState();
   postBotStatusToServer({ connecting: true, connected: botConnected });
 
@@ -1242,6 +1256,7 @@ function connectTikTok(username) {
       entry.connected = true;
       entry.currentRoomId = state?.roomId ? String(state.roomId) : null;
       ok(`Connected to TikTok Live @${entry.username}`);
+      postAdminLog('success', 'tiktok', `Connected to TikTok Live @${entry.username}`, { roomId: entry.currentRoomId });
       if (state?.roomId) info(`@${entry.username} Room ID: ${state.roomId}`);
       updateAggregateBotState();
       postBotStatusToServer({ connected: botConnected, connecting: false, roomId: currentRoomId });
@@ -1259,8 +1274,10 @@ function connectTikTok(username) {
 
       const message = String(e?.message || e || 'unknown error');
       err(`TikTok connect failed for @${entry.username}: ${message}`);
+      postAdminLog('error', 'tiktok', `TikTok connect failed for @${entry.username}: ${message}`);
       if (!getSessionIdForUsername(entry.username)) warn(`Tip: set a sessionid for @${entry.username}. Use TIKTOK_SESSION_ID for primary, TIKTOK_SESSION_ID_2 for the second stream, or TIKTOK_SESSION_IDS=username=sessionid.`);
       info(`Keeping @${entry.username} armed. Retrying in ${Math.round(delay / 1000)}s so you do NOT have to redeploy when that live starts.`);
+      postAdminLog('info', 'tiktok', `Keeping @${entry.username} armed. Retrying in ${Math.round(delay / 1000)}s`);
       postBotStatusToServer({ connected: botConnected, connecting: false, error: `@${entry.username}: ${message}` });
       scheduleReconnect(entry.username, delay);
     });
@@ -1342,6 +1359,7 @@ function registerTikTokEvents(entry) {
     if (!isCmd) return;
 
     cmd(`[${sourceUsername}] queue command heard from @${display} / key=${userKey}: ${msg}`);
+    postAdminLog('info', 'queue', `@${display} typed ${msg}`, { stream: sourceUsername, tiktokId });
 
     // Prevent duplicate handling if a connector emits both `chat` and `comment`
     // for the same message. Keeps one person from being queued twice.
@@ -1355,6 +1373,7 @@ function registerTikTokEvents(entry) {
 
     if (BANNED_TIKTOK_USERS.has(tiktokId)) {
       cmd(`[${sourceUsername}] [blocked] @${display} tried command: ${msg}`);
+      postAdminLog('warn', 'queue', `Blocked TikTok user @${display} tried ${msg}`, { stream: sourceUsername, tiktokId });
       return;
     }
 
@@ -1363,6 +1382,7 @@ function registerTikTokEvents(entry) {
     const cooldownKey = `${userKey}:join`;
     if (isJoinCommand && isOnCooldown(cooldownKey)) {
       cmd(`[${sourceUsername}] [cooldown] @${tiktokId} — ignored join (${COOLDOWN_MS / 1000}s cooldown)`);
+      postAdminLog('warn', 'queue', `Cooldown ignored @${display}`, { stream: sourceUsername, tiktokId });
       return;
     }
 
@@ -1376,6 +1396,7 @@ function registerTikTokEvents(entry) {
     if (!afterCommand) {
       respond(tiktokId, 'Use queue <YourUbisoftName> or !queue <YourUbisoftName>.', sourceUsername);
       cmd(`[${sourceUsername}] [queue] @${display} missing Ubisoft name`);
+      postAdminLog('warn', 'queue', `Rejected @${display}: missing Ubisoft name`, { stream: sourceUsername, tiktokId });
       return;
     }
     let record         = getRecord(users, userKey);
@@ -1412,6 +1433,7 @@ function registerTikTokEvents(entry) {
         respond(tiktokId, `You are already in queue as ${record.name}${pos ? ` (#${pos})` : ''}. Ask admin to change it.`, sourceUsername);
       }
       cmd(`[${sourceUsername}] [queue] @${display} already active as ${record.name}`);
+      postAdminLog('warn', 'queue', `Rejected @${display}: already active as ${record.name}`, { stream: sourceUsername, tiktokId, name: record.name });
       return;
     }
 
@@ -1420,6 +1442,7 @@ function registerTikTokEvents(entry) {
       if (!valid.ok) {
         respond(tiktokId, valid.reason, sourceUsername);
         cmd(`[${sourceUsername}] [queue] @${display} invalid name: "${afterCommand}" (${valid.reason})`);
+        postAdminLog('warn', 'queue', `Rejected @${display}: ${valid.reason}`, { stream: sourceUsername, tiktokId, input: afterCommand });
         return;
       }
       let clean = valid.name;
@@ -1435,6 +1458,7 @@ function registerTikTokEvents(entry) {
       if (record.name && record.name.toLowerCase() !== clean.toLowerCase()) {
         respond(tiktokId, `Your saved Ubisoft name is ${record.name}. Use queue with that exact name, or ask admin to change it first.`, sourceUsername);
         cmd(`[${sourceUsername}] [queue] @${display} tried to change ${record.name} → ${clean} without admin edit`);
+        postAdminLog('warn', 'queue', `Rejected @${display}: tried to change saved name ${record.name} → ${clean}`, { stream: sourceUsername, tiktokId });
         return;
       }
 
@@ -1442,6 +1466,7 @@ function registerTikTokEvents(entry) {
       if (takenMsg) {
         respond(tiktokId, takenMsg, sourceUsername);
         cmd(`[${sourceUsername}] [queue] @${display} ✗ name "${clean}" blocked by name checker`);
+        postAdminLog('warn', 'queue', `Rejected @${display}: ${takenMsg}`, { stream: sourceUsername, tiktokId, name: clean });
         return;
       }
       const result = await addToQueue(clean);
@@ -1452,11 +1477,13 @@ function registerTikTokEvents(entry) {
         const pos = getPosition(clean) || '?';
         respond(tiktokId, result === 'added' ? `${clean} added to queue! Position: #${pos}` : `${clean} is already in queue at #${pos}.`, sourceUsername);
         ok(`[${sourceUsername}] [queue] @${display} → ${clean} ${result} (#${pos})`);
+        postAdminLog('success', 'queue', `${clean} ${result === 'added' ? 'added to queue' : 'already in queue'} from @${display}`, { stream: sourceUsername, tiktokId, name: clean, position: pos, result });
       } else {
         // Important: do NOT save the TikTok → Ubisoft name if the website queue rejected it.
         // This stops random TikTok chat words/bad names from getting stuck on the account.
         respond(tiktokId, `Could not add "${clean}" to the queue. Check the name and try: queue YourUbisoftName`, sourceUsername);
         err(`[${sourceUsername}] [queue] @${display} → server rejected ${clean}; not saving it`);
+        postAdminLog('error', 'queue', `Server rejected ${clean} from @${display}`, { stream: sourceUsername, tiktokId, name: clean });
       }
       return;
     }
@@ -1476,6 +1503,7 @@ function registerTikTokEvents(entry) {
     entry.currentRoomId = null;
     updateAggregateBotState();
     warn(`TikTok disconnected @${sourceUsername} — reconnecting in 15 seconds. No redeploy needed.`);
+    postAdminLog('warn', 'tiktok', `TikTok disconnected @${sourceUsername}. Reconnecting in 15 seconds.`);
     entry.retryDelay = 15_000;
     postBotStatusToServer({ connected: botConnected, connecting: false, error: `@${sourceUsername} disconnected` });
     scheduleReconnect(sourceUsername, 15_000);
@@ -1483,6 +1511,7 @@ function registerTikTokEvents(entry) {
 
   tiktok.on('error', e => {
     err(`TikTok stream error @${sourceUsername}:`, e.message || JSON.stringify(e));
+    postAdminLog('error', 'tiktok', `TikTok stream error @${sourceUsername}: ${e.message || JSON.stringify(e)}`);
     postBotStatusToServer({ connected: botConnected, error: `@${sourceUsername}: ${String(e.message || e)}` });
   });
 
