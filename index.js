@@ -164,7 +164,7 @@ ${C.cyan}${C.bold}╔═══════════════════�
   Users : ${C.yellow}${DATA_FILE}${C.reset}
   Sync  : ${C.green}Admin panel config sync ENABLED${C.reset}
 
-  ${C.dim}Commands: queue/!queue <UbisoftName> only  •  q/!q disabled  •  clear/reset chat commands disabled  •  bare-name fallback OFF${C.reset}
+  ${C.dim}Commands: !queue/queue <UbisoftName> to join  •  !l to leave queue  •  !r to reset saved name  •  q/!q disabled  •  bare-name fallback OFF${C.reset}
 `);
 }
 
@@ -878,6 +878,17 @@ function getSavedUsersForAdmin() {
  * Post the bot's current live status to the server.
  */
 
+// Fire-and-forget: send every raw TikTok message to the server ring buffer.
+// Non-critical — never throws, never awaited by the caller.
+function mirrorChatMessage({ stream, tiktokId, nickname, msg, event }) {
+  if (!ADMIN_PASSWORD) return;
+  fetchWithTimeout(`${BASE_URL}/api/bot/chat`, {
+    method : 'POST',
+    headers: authHeaders(),
+    body   : JSON.stringify({ stream, tiktokId, nickname, msg, event, ts: Date.now() }),
+  }, 4_000).catch(() => {});
+}
+
 async function postAdminLog(type, category, message, meta = {}) {
   if (!ADMIN_PASSWORD) return;
   try {
@@ -1353,9 +1364,17 @@ function registerTikTokEvents(entry) {
     // Pick up admin edits/deletes to saved TikTok names without restarting the bot.
     reloadUsersFromDisk();
 
+    // ── Mirror every raw message to the server for live monitoring ────────────
+    // This runs BEFORE any command filtering so you can see exactly what TikTok
+    // is delivering — whether commands arrive at all, and from whom.
+    mirrorChatMessage({ stream: sourceUsername, tiktokId: rawTikTokId, nickname: display, msg, event: eventName });
+
     const bareJoinName = '';
     const isBareJoin = false;
-    const isCmd = JOIN_COMMAND_RE.test(msg);
+    const isJoinCmd  = JOIN_COMMAND_RE.test(msg);
+    const isResetCmd = /^!r\b/i.test(msg);   // !r  — reset saved name
+    const isLeaveCmd = /^!l\b/i.test(msg);   // !l  — leave queue
+    const isCmd = isJoinCmd || isResetCmd || isLeaveCmd;
     if (!isCmd) return;
 
     cmd(`[${sourceUsername}] queue command heard from @${display} / key=${userKey}: ${msg}`);
@@ -1377,19 +1396,82 @@ function registerTikTokEvents(entry) {
       return;
     }
 
-    // Only rate-limit queue JOIN commands.
-    const isJoinCommand = JOIN_COMMAND_RE.test(msg);
+    // Only rate-limit queue JOIN and RESET commands (leave is always allowed).
     const cooldownKey = `${userKey}:join`;
-    if (isJoinCommand && isOnCooldown(cooldownKey)) {
+    if (isJoinCmd && isOnCooldown(cooldownKey)) {
       cmd(`[${sourceUsername}] [cooldown] @${tiktokId} — ignored join (${COOLDOWN_MS / 1000}s cooldown)`);
       postAdminLog('warn', 'queue', `Cooldown ignored @${display}`, { stream: sourceUsername, tiktokId });
       return;
     }
 
 
+    // ── !r — reset saved name ────────────────────────────────────────────────
+    if (isResetCmd) {
+      const resetCooldownKey = `${userKey}:reset`;
+      if (isOnCooldown(resetCooldownKey)) {
+        cmd(`[${sourceUsername}] [cooldown] @${tiktokId} — ignored !r (${COOLDOWN_MS / 1000}s cooldown)`);
+        return;
+      }
+      setCooldown(resetCooldownKey);
+
+      const record = getRecord(users, userKey);
+      if (!record.name) {
+        respond(tiktokId, 'You have no saved name to reset. Type: queue YourUbisoftName to join.', sourceUsername);
+        cmd(`[${sourceUsername}] [!r] @${display} has no saved name`);
+        return;
+      }
+      const oldName = record.name;
+      // Remove from queue first if they are currently active.
+      if (record.queued || isInQueue(oldName) || isPlaying(oldName)) {
+        await refreshLiveQueueFromServer();
+        await removeFromQueue(oldName);
+        await refreshLiveQueueFromServer();
+      }
+      users[userKey] = { name: '', queued: false };
+      saveUsers(users);
+      respond(tiktokId, `Saved name "${oldName}" cleared. Type: queue YourNewUbisoftName to rejoin.`, sourceUsername);
+      ok(`[${sourceUsername}] [!r] @${display} reset saved name ${oldName}`);
+      postAdminLog('info', 'queue', `@${display} reset saved name ${oldName}`, { stream: sourceUsername, tiktokId, name: oldName });
+      postBotStatusToServer().catch(() => {});
+      return;
+    }
+
+    // ── !l — leave queue ─────────────────────────────────────────────────────
+    if (isLeaveCmd) {
+      await refreshLiveQueueFromServer();
+      const record = getRecord(users, userKey);
+      const nameToRemove = record.name;
+      if (!nameToRemove || (!isInQueue(nameToRemove) && !isPlaying(nameToRemove))) {
+        respond(tiktokId, 'You are not currently in the queue.', sourceUsername);
+        cmd(`[${sourceUsername}] [!l] @${display} not in queue`);
+        postAdminLog('warn', 'queue', `@${display} used !l but is not in queue`, { stream: sourceUsername, tiktokId });
+        return;
+      }
+      const leaveResult = await removeFromQueue(nameToRemove);
+      if (leaveResult === 'removed') {
+        users[userKey] = { name: nameToRemove, queued: false };
+        saveUsers(users);
+        await refreshLiveQueueFromServer();
+        respond(tiktokId, `${nameToRemove} has been removed from the queue.`, sourceUsername);
+        ok(`[${sourceUsername}] [!l] @${display} left queue: ${nameToRemove}`);
+        postAdminLog('success', 'queue', `${nameToRemove} left queue from @${display}`, { stream: sourceUsername, tiktokId, name: nameToRemove });
+        postBotStatusToServer().catch(() => {});
+      } else if (leaveResult === 'not_found') {
+        // Queue already cleared on website — sync local state
+        users[userKey] = { name: nameToRemove, queued: false };
+        saveUsers(users);
+        respond(tiktokId, 'You are not currently in the queue.', sourceUsername);
+        cmd(`[${sourceUsername}] [!l] @${display} not found on server queue`);
+      } else {
+        respond(tiktokId, 'Could not remove you from the queue right now. Try again.', sourceUsername);
+        err(`[${sourceUsername}] [!l] removeFromQueue error for ${nameToRemove}: ${leaveResult}`);
+      }
+      return;
+    }
+
     // Clear/reset chat commands are intentionally disabled. Admin handles removals and saved-name edits.
 
-    if (!JOIN_COMMAND_RE.test(msg) && !isBareJoin) return;
+    if (!isJoinCmd && !isBareJoin) return;
     setCooldown(cooldownKey);
 
     const afterCommand = msg.replace(JOIN_COMMAND_RE, '').trim();
