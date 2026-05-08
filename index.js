@@ -1038,9 +1038,11 @@ async function postAdminLog(type, category, message, meta = {}) {
 
 async function postBotStatusToServer(extra = {}) {
   if (!ADMIN_PASSWORD) return;
-  const knownUsers = Object.keys(users).length;
-  const queuedRecords = Object.values(users).filter(r => r?.queued).length;
   const savedUsers = getSavedUsersForAdmin();
+  const knownRecords = Object.keys(users).length;
+  const savedNameCount = savedUsers.length;
+  const emptyRecords = Math.max(0, knownRecords - savedNameCount);
+  const queuedRecords = savedUsers.filter(r => r?.queued || r?.active || r?.inQueue || r?.playing).length;
   try {
     await fetchWithTimeout(`${BASE_URL}/api/bot/status`, {
       method: 'POST',
@@ -1053,7 +1055,13 @@ async function postBotStatusToServer(extra = {}) {
         roomId       : extra.roomId       ?? currentRoomId,
         lastActivity : new Date().toISOString(),
         processUptime: Math.floor(process.uptime()),
-        knownUsers,
+        // knownUsers is kept for old server/admin builds and now means real saved names.
+        knownUsers: savedNameCount,
+        savedNameCount,
+        totalSavedNames: savedNameCount,
+        knownRecords,
+        totalRecords: knownRecords,
+        emptyRecords,
         queuedRecords,
         liveQueueLen : liveQueue.length,
         savedUsers,
@@ -1929,9 +1937,10 @@ setInterval(applyAdminSavedNameOverrides, 5_000);
 // ── Stats printer (every 5 min) ─────────────────────────────────────────────
 
 setInterval(() => {
-  const knownUsers    = Object.keys(users).length;
-  const queued        = Object.values(users).filter(r => r?.queued).length;
-  info(`Stats — enabled streams: ${getStreamUsers().map(u => '@' + u).join(', ') || 'none'}, known users: ${knownUsers}, queued records: ${queued}, live queue: ${liveQueue.length}, playing: ${livePlaying.length}, viewers: ${currentViewers}`);
+  const knownRecords  = Object.keys(users).length;
+  const savedNames    = getSavedUsersForAdmin().length;
+  const queued        = getSavedUsersForAdmin().filter(r => r?.queued || r?.active || r?.inQueue || r?.playing).length;
+  info(`Stats — enabled streams: ${getStreamUsers().map(u => '@' + u).join(', ') || 'none'}, saved names: ${savedNames}, known records: ${knownRecords}, queued records: ${queued}, live queue: ${liveQueue.length}, playing: ${livePlaying.length}, viewers: ${currentViewers}`);
 }, 5 * 60_000);
 
 // ── Start ───────────────────────────────────────────────────────────────────
