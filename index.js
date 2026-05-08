@@ -150,6 +150,77 @@ const err  = (...a) => log('ERR  ', C.red, ...a);
 const cmd  = (...a) => log('CMD  ', C.magenta, ...a);
 const poll = (...a) => log('POLL ', C.blue, ...a);
 
+function safeStringify(value) {
+  try {
+    if (value === undefined || value === null) return '';
+    if (typeof value === 'string') return value;
+    if (value instanceof Error) return value.message || value.name || 'Error';
+    return JSON.stringify(value, (key, val) => {
+      if (val instanceof Error) return { name: val.name, message: val.message, stack: val.stack };
+      if (typeof val === 'function') return undefined;
+      return val;
+    });
+  } catch (_) {
+    return String(value || 'unknown error');
+  }
+}
+
+function cleanTikTokErrorMessage(error) {
+  const candidates = [
+    error?.message,
+    error?.info,
+    error?.error,
+    error?.exception?.message,
+    error?.exception?.info,
+    error?.cause?.message,
+  ].filter(v => v !== undefined && v !== null && String(v).trim());
+
+  let text = candidates.length ? String(candidates[0]) : safeStringify(error);
+  text = String(text || 'unknown error').trim();
+
+  // Never show the useless JavaScript object string in the admin panel.
+  if (!text || text === '[object Object]' || text === '{}') {
+    const json = safeStringify(error);
+    text = json && json !== '{}' && json !== '[object Object]' ? json : 'TikTok returned an empty connection error';
+  }
+
+  if (/LIVE has ended/i.test(text)) return 'Live is not active or has ended';
+  if (/Error while connecting/i.test(text)) return 'TikTok refused the live connection attempt';
+  if (/roomId|room id/i.test(text)) return text;
+  return text;
+}
+
+function tikTokErrorHelp(error) {
+  const raw = [
+    error?.message,
+    error?.info,
+    error?.error,
+    error?.exception?.message,
+    safeStringify(error),
+  ].join(' ');
+
+  if (/LIVE has ended|not active|has ended/i.test(raw)) {
+    return 'Live is offline. The bot will stay armed and auto-connect when the stream starts.';
+  }
+  if (/Error while connecting/i.test(raw)) {
+    return 'TikTok rejected the connection. This often happens when the account is not live, the live is private, or TikTok is rate-limiting the connection.';
+  }
+  if (/session/i.test(raw)) {
+    return 'Session/cookie may be invalid. Refresh the TikTok session ID if this keeps happening while the live is active.';
+  }
+  return 'The bot will keep retrying automatically.';
+}
+
+function shouldLogStreamError(entry, message) {
+  const key = String(message || '').toLowerCase();
+  const now = Date.now();
+  if (entry.lastStreamErrorKey === key && now - Number(entry.lastStreamErrorAt || 0) < 10_000) return false;
+  entry.lastStreamErrorKey = key;
+  entry.lastStreamErrorAt = now;
+  return true;
+}
+
+
 function printBanner() {
   console.log(`
 ${C.cyan}${C.bold}╔══════════════════════════════════════════╗
@@ -1174,6 +1245,8 @@ function ensureStream(username) {
     currentViewers: 0,
     currentRoomId: null,
     lastConnectAttempt: 0,
+    lastStreamErrorKey: '',
+    lastStreamErrorAt: 0,
   };
   streams.set(username, entry);
   createFreshTikTokConnection(entry);
@@ -1283,12 +1356,28 @@ function connectTikTok(username) {
       entry.retryDelay = Math.min(entry.retryDelay * 2, MAX_RETRY_MS);
       updateAggregateBotState();
 
-      const message = String(e?.message || e || 'unknown error');
-      err(`TikTok connect failed for @${entry.username}: ${message}`);
-      postAdminLog('error', 'tiktok', `TikTok connect failed for @${entry.username}: ${message}`);
-      if (!getSessionIdForUsername(entry.username)) warn(`Tip: set a sessionid for @${entry.username}. Use TIKTOK_SESSION_ID for primary, TIKTOK_SESSION_ID_2 for the second stream, or TIKTOK_SESSION_IDS=username=sessionid.`);
-      info(`Keeping @${entry.username} armed. Retrying in ${Math.round(delay / 1000)}s so you do NOT have to redeploy when that live starts.`);
-      postAdminLog('info', 'tiktok', `Keeping @${entry.username} armed. Retrying in ${Math.round(delay / 1000)}s`);
+      const message = cleanTikTokErrorMessage(e);
+      const help = tikTokErrorHelp(e);
+      const retrySeconds = Math.round(delay / 1000);
+      const isOffline = /not active|ended|offline/i.test(message + ' ' + help);
+      const logType = isOffline ? 'warn' : 'error';
+
+      const adminMessage = `@${entry.username}: ${message}. ${help} Retrying in ${retrySeconds}s.`;
+      if (isOffline) warn(adminMessage);
+      else err(`TikTok connect failed — ${adminMessage}`);
+
+      postAdminLog(logType, 'tiktok', adminMessage, {
+        stream: entry.username,
+        retrySeconds,
+        raw: safeStringify(e),
+      });
+
+      if (!getSessionIdForUsername(entry.username)) {
+        warn(`Tip: set a sessionid for @${entry.username}. Use TIKTOK_SESSION_ID for primary, TIKTOK_SESSION_ID_2 for the second stream, or TIKTOK_SESSION_IDS=username=sessionid.`);
+      }
+
+      info(`Keeping @${entry.username} armed. Retrying in ${retrySeconds}s — no redeploy needed when the live starts.`);
+      postAdminLog('info', 'tiktok', `Keeping @${entry.username} armed. Retrying in ${retrySeconds}s`, { stream: entry.username });
       postBotStatusToServer({ connected: botConnected, connecting: false, error: `@${entry.username}: ${message}` });
       scheduleReconnect(entry.username, delay);
     });
@@ -1592,9 +1681,23 @@ function registerTikTokEvents(entry) {
   });
 
   tiktok.on('error', e => {
-    err(`TikTok stream error @${sourceUsername}:`, e.message || JSON.stringify(e));
-    postAdminLog('error', 'tiktok', `TikTok stream error @${sourceUsername}: ${e.message || JSON.stringify(e)}`);
-    postBotStatusToServer({ connected: botConnected, error: `@${sourceUsername}: ${String(e.message || e)}` });
+    const message = cleanTikTokErrorMessage(e);
+    const help = tikTokErrorHelp(e);
+    const offlineLike = /not active|ended|offline|refused the live connection/i.test(message + ' ' + help);
+
+    // A failed connect can fire both the promise catch and the stream error event.
+    // Throttle duplicates so the admin log stays useful instead of spamming [object Object].
+    if (!shouldLogStreamError(entry, message)) return;
+
+    const fullMessage = `@${sourceUsername}: ${message}. ${help}`;
+    if (offlineLike) warn(`TikTok stream warning — ${fullMessage}`);
+    else err(`TikTok stream error — ${fullMessage}`);
+
+    postAdminLog(offlineLike ? 'warn' : 'error', 'tiktok', fullMessage, {
+      stream: sourceUsername,
+      raw: safeStringify(e),
+    });
+    postBotStatusToServer({ connected: botConnected, error: `@${sourceUsername}: ${message}` });
   });
 
   // Viewer count updates only. Do NOT queue anyone from roomUser/join events.
