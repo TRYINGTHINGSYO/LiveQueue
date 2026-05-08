@@ -172,7 +172,7 @@ ${C.cyan}${C.bold}╔═══════════════════�
   Users : ${C.yellow}${DATA_FILE}${C.reset}
   Sync  : ${C.green}Admin panel config sync ENABLED${C.reset}
 
-  ${C.dim}Commands: !queue/queue <UbisoftName> to join  •  !queue to rejoin saved name  •  !c or !l to leave  •  !r to reset saved name  •  cooldown is per TikTok account  •  q/!q disabled${C.reset}
+  ${C.dim}Commands: queue <UbisoftName> to save/join  •  queue to rejoin saved name  •  leave to leave queue  •  reset to clear saved name  •  NO ! commands  •  bare-name fallback OFF${C.reset}
 `);
 }
 
@@ -185,7 +185,7 @@ ${C.cyan}${C.bold}╔═══════════════════�
 //   - q and !q are disabled.
 //   - clear/reset chat commands are disabled. Admin handles removals/edits.
 //   - a Ubisoft name must be included after queue/!queue.
-const JOIN_COMMAND_RE = /^(?:!queue|queue)\s+/i;
+const JOIN_COMMAND_RE = /^queue\s+/i;
 const CLEAR_COMMAND_RE = /a^/;
 const RESET_COMMAND_RE = /a^/;
 
@@ -193,55 +193,33 @@ const RESET_COMMAND_RE = /a^/;
 // Also, TikTok/mobile users often type !queueName with no space.
 // This parser accepts those safe variants while still blocking random bare chat.
 function parseBotCommandMessage(message) {
-  const raw = String(message || '').trim();
-  if (!raw) return { type: '', arg: '', normalizedCommand: '' };
+  const text = String(message || '').trim();
+  if (!text) return { type: '', arg: '', normalizedCommand: '' };
 
-  // Normalize full-width exclamation and common "!" lookalikes at the start.
-  const text = raw.replace(/^！/, '!');
-
-  // Leave queue. Supports !l, !c, /l, /c.
-  // Kept strict so normal chat does not accidentally remove people.
-  if (/^[!\/]\s*[lc]\b/i.test(text)) {
-    return { type: 'leave', arg: '', normalizedCommand: '!c' };
-  }
-
-  // Reset saved name. Supports !r or /r.
-  if (/^[!\/]\s*r\b/i.test(text)) {
-    return { type: 'reset', arg: '', normalizedCommand: '!r' };
-  }
-
-  // Join command variants:
-  //   !queue Name
-  //   queue Name
-  //   !queueName
-  //   1queue Name      (common TikTok typo for !queue)
-  //   lqueue Name      (lowercase L typo for !queue)
-  //   Iqueue Name      (uppercase i typo for !queue)
-  //   |queue Name      (pipe typo for !queue)
+  // ONLY allowed chat commands:
+  //   queue UbisoftName  = save/add that Ubisoft name
+  //   queue              = add saved Ubisoft name
+  //   leave              = leave the queue
+  //   reset              = clear saved Ubisoft name
   //
-  // Plain "queueName" without !/1/l/I/| is intentionally NOT accepted because
-  // it can catch normal words like "queued". No-space is only allowed when the
-  // user typed a command-looking prefix.
-  const m = text.match(/^([!1lI|]?queue)(.*)$/i);
-  if (!m) return { type: '', arg: '', normalizedCommand: '' };
+  // No !queue, !q, q, !c, !l, !r, !reset, !leave, or bare-name fallback.
+  const lower = text.toLowerCase();
 
-  const token = m[1] || '';
-  const tail = m[2] || '';
-  const hasCommandPrefix = /^[!1lI|]/.test(token);
-
-  // Exact "queue" / "!queue" means use saved name.
-  if (tail.length === 0) {
-    return { type: 'join', arg: '', normalizedCommand: '!queue' };
+  if (lower === 'leave') {
+    return { type: 'leave', arg: '', normalizedCommand: 'leave' };
   }
 
-  // Normal format: queue Name / !queue Name / 1queue Name.
-  if (/^\s+/.test(tail)) {
-    return { type: 'join', arg: tail.trim(), normalizedCommand: '!queue' };
+  if (lower === 'reset') {
+    return { type: 'reset', arg: '', normalizedCommand: 'reset' };
   }
 
-  // No-space format is accepted only for prefixed variants like !queueName or 1queueName.
-  if (hasCommandPrefix && /^[A-Za-z0-9_.-]/.test(tail)) {
-    return { type: 'join', arg: tail.trim(), normalizedCommand: '!queue' };
+  if (lower === 'queue') {
+    return { type: 'join', arg: '', normalizedCommand: 'queue' };
+  }
+
+  const match = text.match(/^queue\s+(.+)$/i);
+  if (match) {
+    return { type: 'join', arg: match[1].trim(), normalizedCommand: 'queue' };
   }
 
   return { type: '', arg: '', normalizedCommand: '' };
@@ -498,34 +476,6 @@ function streamUserKey(sourceUsername, tiktokId) {
 function displayUserKey(key) {
   const parts = String(key || '').split(':');
   return parts.length > 1 ? parts.slice(1).join(':') : String(key || '');
-}
-
-// Build a safe per-person key for cooldowns and saved names.
-// TikTok usually sends uniqueId, but sometimes connector events can miss it.
-// Never let missing uniqueId become one shared "unknown" cooldown for everyone.
-function safeTikTokIdentity(data, display, sourceUsername = '') {
-  const unique = normalizeTikTokUsername(
-    data?.uniqueId ||
-    data?.user?.uniqueId ||
-    data?.userId ||
-    data?.user?.id ||
-    data?.user?.secUid ||
-    ''
-  );
-
-  if (unique && unique !== 'unknown') return unique;
-
-  const fallbackDisplay = normalizeTikTokUsername(display || data?.nickname || data?.user?.nickname || '');
-  if (fallbackDisplay && fallbackDisplay !== 'unknown') {
-    return `display-${fallbackDisplay}`;
-  }
-
-  return `anon-${normalizeTikTokUsername(sourceUsername || 'stream')}`;
-}
-
-function cooldownRemainingMs(key) {
-  const last = cooldowns.get(key) || 0;
-  return Math.max(0, COOLDOWN_MS - (Date.now() - last));
 }
 
 function canonicalName(raw) {
@@ -1539,10 +1489,10 @@ function registerTikTokEvents(entry) {
   // others emit them as `comment`. Register BOTH for every stream so every
   // enabled live can use queue/!queue <UbisoftName>. No other chat commands queue players.
   const handleChatCommand = async (data, eventName = 'chat') => {
-    const display  = data?.nickname || data?.user?.nickname || data?.uniqueId || data?.user?.uniqueId || 'unknown';
-    const rawTikTokId = safeTikTokIdentity(data, display, sourceUsername);
+    const rawTikTokId = normalizeTikTokUsername(data?.uniqueId || data?.user?.uniqueId || data?.userId || data?.user?.id || '');
     const tiktokId = rawTikTokId;
     const userKey = streamUserKey(sourceUsername, rawTikTokId);
+    const display  = data?.nickname || data?.user?.nickname || data?.uniqueId || rawTikTokId;
     const msg      = String(data?.comment || data?.text || data?.content || data?.msg || '').trim();
     const lower    = msg.toLowerCase();
     markTikTokEvent(entry);
@@ -1587,15 +1537,8 @@ function registerTikTokEvents(entry) {
     // Only rate-limit queue JOIN and RESET commands (leave is always allowed).
     const cooldownKey = `${userKey}:join`;
     if (isJoinCmd && isOnCooldown(cooldownKey)) {
-      const left = Math.ceil(cooldownRemainingMs(cooldownKey) / 1000);
-      cmd(`[${sourceUsername}] [cooldown] @${display} / key=${userKey} — ignored join (${left}s left, per-user cooldown)`);
-      postAdminLog('warn', 'queue', `Cooldown ignored @${display}: wait ${left}s`, {
-        stream: sourceUsername,
-        tiktokId,
-        userKey,
-        cooldownKey,
-        remainingSeconds: left
-      });
+      cmd(`[${sourceUsername}] [cooldown] @${tiktokId} — ignored join (${COOLDOWN_MS / 1000}s cooldown)`);
+      postAdminLog('warn', 'queue', `Cooldown ignored @${display}`, { stream: sourceUsername, tiktokId });
       return;
     }
 
@@ -1667,23 +1610,19 @@ function registerTikTokEvents(entry) {
     // Clear/reset chat commands are intentionally disabled. Admin handles removals and saved-name edits.
 
     if (!isJoinCmd && !isBareJoin) return;
+    setCooldown(cooldownKey);
 
     const afterCommand = String(parsedCommand.arg || '').trim();
     if (!afterCommand) {
       // If they already saved a name, !queue by itself should rejoin them.
       const savedRecord = getRecord(users, userKey);
       if (!savedRecord.name) {
-        respond(tiktokId, 'Use !queue <YourUbisoftName>. Example: !queue Blake', sourceUsername);
+        respond(tiktokId, 'Use queue <YourUbisoftName>. Example: queue Blake', sourceUsername);
         cmd(`[${sourceUsername}] [queue] @${display} missing Ubisoft name`);
         postAdminLog('warn', 'queue', `Rejected @${display}: missing Ubisoft name`, { stream: sourceUsername, tiktokId });
         return;
       }
     }
-
-    // Only start the join cooldown after the command is valid enough to process.
-    // This prevents a bad "!queue" with no saved name from locking the person out.
-    setCooldown(cooldownKey);
-
     let record         = getRecord(users, userKey);
     const joinNameFromCommand = afterCommand || record.name || '';
 
