@@ -172,7 +172,7 @@ ${C.cyan}${C.bold}╔═══════════════════�
   Users : ${C.yellow}${DATA_FILE}${C.reset}
   Sync  : ${C.green}Admin panel config sync ENABLED${C.reset}
 
-  ${C.dim}Commands: queue <UbisoftName> to save/join  •  queue to rejoin saved name  •  leave to leave queue  •  reset to clear saved name  •  NO ! commands  •  bare-name fallback OFF${C.reset}
+  ${C.dim}Commands: queue <UbisoftName> to save/join (spaces allowed for console players)  •  queue to rejoin saved name  •  leave to leave queue  •  reset to clear saved name  •  NO ! commands  •  bare-name fallback OFF${C.reset}
 `);
 }
 
@@ -589,25 +589,22 @@ const BAD_NAME_PATTERNS = [
 ];
 
 function validateName(rawName) {
-  const raw = String(rawName || '').trim();
+  const raw = String(rawName || '').replace(/\s+/g, ' ').trim();
   if (!raw) return { ok: false, reason: 'Type one name after queue. Example: queue Blake' };
 
-  // Be forgiving for TikTok chat typos.
-  // People often type Ubisoft names with accidental spaces: "bray bray15", "Lilcoper Stretch", "xX Blake Xx".
-  // Ubisoft-style queue names cannot contain spaces, so collapse spaces instead of ignoring the command.
-  const compact = raw.replace(/\s+/g, '');
-  if (!compact) return { ok: false, reason: 'Type one name after queue. Example: queue Blake' };
-
-  const clean = compact.replace(/[^a-zA-Z0-9_.-]/g, '').slice(0, 20);
+  // Console players can have spaces in their displayed Ubisoft/console name.
+  // Keep the spaces, but normalize multiple spaces down to one.
+  const clean = raw;
   if (clean.length < 3) return { ok: false, reason: 'Name must be at least 3 characters.' };
+  if (clean.length > 24) return { ok: false, reason: 'Name must be 24 characters or fewer.' };
   if (!/[a-zA-Z]/.test(clean)) return { ok: false, reason: 'Name must include at least one letter.' };
-  if (clean !== compact) return { ok: false, reason: 'Use letters, numbers, _ . - only. No weird symbols.' };
+  if (!/^[a-zA-Z0-9_.\- ]+$/.test(clean)) return { ok: false, reason: 'Use letters, numbers, spaces, _ . - only.' };
 
   const normalized = normalizeForFilter(clean);
   if (RESERVED_NAMES.has(normalized)) return { ok: false, reason: 'That name is reserved. Pick a different name.' };
   if (BLOCKED_EXACT_NAMES.has(normalized)) return { ok: false, reason: 'That name is blocked. Pick a different name.' };
   if (BAD_NAME_PATTERNS.some(re => re.test(normalized))) return { ok: false, reason: 'That name is not allowed. Pick a clean name.' };
-  return { ok: true, name: clean, compacted: clean !== raw };
+  return { ok: true, name: clean, console: /\s/.test(clean) };
 }
 
 function cleanName(raw) {
@@ -1669,7 +1666,7 @@ function registerTikTokEvents(entry) {
       }
 
       if (!oldName) {
-        respond(tiktokId, 'You have no saved name to reset. Type: queue YourUbisoftName to save one.', sourceUsername);
+        respond(tiktokId, 'You have no saved name to reset. Type: queue YourUbisoftName to save one. Spaces are allowed for console players.', sourceUsername);
         cmd(`[${sourceUsername}] [reset] @${display} has no saved name`);
         postAdminLog('warn', 'queue', `Reset ignored @${display}: no saved name`, { stream: sourceUsername, tiktokId, userKey });
         return;
@@ -1746,7 +1743,7 @@ function registerTikTokEvents(entry) {
       // If they already saved a name, queue by itself should rejoin them.
       const savedRecord = getRecord(users, userKey);
       if (!savedRecord.name) {
-        respond(tiktokId, 'Use queue <YourUbisoftName>. Example: queue Blake', sourceUsername);
+        respond(tiktokId, 'Use queue <YourUbisoftName>. Spaces are allowed for console players. Example: queue Blake', sourceUsername);
         cmd(`[${sourceUsername}] [queue] @${display} missing Ubisoft name`);
         postAdminLog('warn', 'queue', `Rejected @${display}: missing Ubisoft name`, { stream: sourceUsername, tiktokId });
         return;
