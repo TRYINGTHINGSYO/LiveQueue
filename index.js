@@ -751,6 +751,13 @@ async function applyAdminSavedNameOverrides() {
       if (!valid.ok) continue;
       const clean = valid.name;
       const old = getRecord(users, tiktok);
+
+      // If this TikTok account was reset locally, do NOT let stale server overrides
+      // immediately resurrect the old saved name.
+      if (users[tiktok] && typeof users[tiktok] === 'object' && users[tiktok].resetAt && !old.name) {
+        continue;
+      }
+
       if (canonicalName(old.name) === canonicalName(clean)) continue;
 
       // If their old saved name is currently in queue/playing, rename it on the website too.
@@ -789,6 +796,61 @@ async function renamePlayerOnServer(oldName, newName) {
     warn(`[admin-sync] rename-player network error ${oldName} → ${newName}: ${e.message}`);
     return 'error';
   }
+}
+
+// Reset must clear BOTH places:
+// 1. the bot's local users file
+// 2. the website/admin saved-name override store
+//
+// Without this, reset appears to work, then the next /api/admin/bot-user-overrides
+// sync can put the old Ubisoft name right back.
+async function deleteSavedNameOnServer(tiktokKeys = []) {
+  if (!ADMIN_PASSWORD) return false;
+
+  const keys = [...new Set(
+    (Array.isArray(tiktokKeys) ? tiktokKeys : [tiktokKeys])
+      .map(k => normalizeTikTokUsername(displayUserKey(k)))
+      .filter(Boolean)
+  )];
+
+  let changed = false;
+
+  for (const tiktok of keys) {
+    const attempts = [
+      { url: `${BASE_URL}/api/admin/bot-users/delete`, method: 'POST', body: { tiktok, username: tiktok } },
+      { url: `${BASE_URL}/api/admin/bot-users/remove`, method: 'POST', body: { tiktok, username: tiktok } },
+      { url: `${BASE_URL}/api/admin/bot-users/update`, method: 'POST', body: { tiktok, username: tiktok, name: '', ubisoft: '', ubisoftName: '' } },
+      { url: `${BASE_URL}/api/admin/bot-user-overrides/delete`, method: 'POST', body: { tiktok, username: tiktok } },
+      { url: `${BASE_URL}/api/admin/bot-users/${encodeURIComponent(tiktok)}`, method: 'DELETE', body: null },
+    ];
+
+    for (const attempt of attempts) {
+      try {
+        const r = await fetchWithTimeout(attempt.url, {
+          method: attempt.method,
+          headers: authHeaders(),
+          ...(attempt.body ? { body: JSON.stringify(attempt.body) } : {}),
+        }, 6_000);
+
+        // 404 just means this server version does not have that route. Try the next route.
+        if (r.status === 404) continue;
+
+        if (r.ok) {
+          changed = true;
+          break;
+        }
+
+        const text = await r.text().catch(() => '');
+        warn(`[reset] server saved-name delete route failed ${attempt.method} ${attempt.url}: ${r.status} ${text}`);
+      } catch (e) {
+        if (!String(e.message || '').includes('aborted')) {
+          warn(`[reset] server saved-name delete network issue for @${tiktok}: ${e.message}`);
+        }
+      }
+    }
+  }
+
+  return changed;
 }
 
 /**
@@ -1611,6 +1673,11 @@ function registerTikTokEvents(entry) {
       }
 
       saveUsers(users);
+
+      // Also clear the website/admin saved-name override, otherwise the next config sync
+      // can put the old name back and make plain "queue" work again.
+      const serverCleared = await deleteSavedNameOnServer([...aliasKeys]);
+      await applyAdminSavedNameOverrides().catch(() => {});
       await refreshLiveQueueFromServer();
 
       respond(tiktokId, `Saved name "${oldName}" cleared. Type: queue YourNewUbisoftName before using queue by itself.`, sourceUsername);
@@ -1621,6 +1688,7 @@ function registerTikTokEvents(entry) {
         userKey,
         name: oldName,
         aliasesCleared: [...aliasKeys],
+        serverCleared,
       });
       postBotStatusToServer().catch(() => {});
       return;
