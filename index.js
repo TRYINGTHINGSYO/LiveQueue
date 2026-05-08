@@ -172,7 +172,7 @@ ${C.cyan}${C.bold}╔═══════════════════�
   Users : ${C.yellow}${DATA_FILE}${C.reset}
   Sync  : ${C.green}Admin panel config sync ENABLED${C.reset}
 
-  ${C.dim}Commands: queue <UbisoftName> to save/join  •  queue to rejoin saved name  •  leave to leave queue  •  reset to clear saved name  •  NO ! commands  •  bare-name fallback OFF${C.reset}
+  ${C.dim}Commands: queue <UbisoftName> to save/join  •  queue to rejoin saved name only if saved  •  leave to leave queue  •  reset to clear saved name  •  NO ! commands  •  bare-name fallback OFF${C.reset}
 `);
 }
 
@@ -198,11 +198,12 @@ function parseBotCommandMessage(message) {
 
   // ONLY allowed chat commands:
   //   queue UbisoftName  = save/add that Ubisoft name
-  //   queue              = add saved Ubisoft name
-  //   leave              = leave the queue
-  //   reset              = clear saved Ubisoft name
+  //   queue              = add saved Ubisoft name, only if one is saved
+  //   leave              = leave the queue, but keep saved name
+  //   reset              = leave queue if active and clear saved name
   //
-  // No !queue, !q, q, !c, !l, !r, !reset, !leave, or bare-name fallback.
+  // These are intentionally NOT allowed:
+  //   !queue, !q, q, !c, !l, !r, !reset, !leave, or bare-name fallback.
   const lower = text.toLowerCase();
 
   if (lower === 'leave') {
@@ -227,7 +228,7 @@ function parseBotCommandMessage(message) {
 
 
 // Bare-name mode is OFF by default so normal TikTok chat words do not get saved as Ubisoft names.
-// Users must type: queue UbisoftName or !queue UbisoftName.
+// Users must type: queue UbisoftName.
 // Set BARE_NAME_MODE=true only if you intentionally want plain-name fallback again.
 let BARE_NAME_MODE = false;
 const DEBUG_BARE_NAME = envBool(process.env.DEBUG_BARE_NAME, false);
@@ -1487,7 +1488,7 @@ function registerTikTokEvents(entry) {
 
   // Some TikTok Live connector versions/accounts emit comments as `chat`;
   // others emit them as `comment`. Register BOTH for every stream so every
-  // enabled live can use queue/!queue <UbisoftName>. No other chat commands queue players.
+  // enabled live can use queue <UbisoftName>. No other chat commands queue players.
   const handleChatCommand = async (data, eventName = 'chat') => {
     const rawTikTokId = normalizeTikTokUsername(data?.uniqueId || data?.user?.uniqueId || data?.userId || data?.user?.id || '');
     const tiktokId = rawTikTokId;
@@ -1543,46 +1544,97 @@ function registerTikTokEvents(entry) {
     }
 
 
-    // ── !r — reset saved name ────────────────────────────────────────────────
+    // ── reset — clear saved name and leave queue if active ─────────────────────
     if (isResetCmd) {
       const resetCooldownKey = `${userKey}:reset`;
       if (isOnCooldown(resetCooldownKey)) {
-        cmd(`[${sourceUsername}] [cooldown] @${tiktokId} — ignored !r (${COOLDOWN_MS / 1000}s cooldown)`);
+        cmd(`[${sourceUsername}] [cooldown] @${display} — ignored reset (${COOLDOWN_MS / 1000}s cooldown)`);
         return;
       }
       setCooldown(resetCooldownKey);
 
-      const record = getRecord(users, userKey);
-      if (!record.name) {
-        respond(tiktokId, 'You have no saved name to reset. Type: queue YourUbisoftName to join.', sourceUsername);
-        cmd(`[${sourceUsername}] [!r] @${display} has no saved name`);
+      // Pull the newest disk state first so we do not reset stale memory.
+      reloadUsersFromDisk();
+
+      const aliasKeys = new Set([
+        normalizeTikTokUsername(userKey),
+        normalizeTikTokUsername(rawTikTokId),
+        normalizeTikTokUsername(display),
+        normalizeTikTokUsername(data?.uniqueId || ''),
+        normalizeTikTokUsername(data?.user?.uniqueId || ''),
+        normalizeTikTokUsername(data?.userId || ''),
+        normalizeTikTokUsername(data?.user?.id || ''),
+        normalizeTikTokUsername(data?.nickname || ''),
+        normalizeTikTokUsername(data?.user?.nickname || ''),
+      ].filter(Boolean));
+
+      // Find any saved name attached to this TikTok account or its old alias keys.
+      let oldName = '';
+      for (const key of aliasKeys) {
+        const rec = getRecord(users, key);
+        if (rec.name) {
+          oldName = rec.name;
+          break;
+        }
+      }
+
+      if (!oldName) {
+        respond(tiktokId, 'You have no saved name to reset. Type: queue YourUbisoftName to save one.', sourceUsername);
+        cmd(`[${sourceUsername}] [reset] @${display} has no saved name`);
+        postAdminLog('warn', 'queue', `Reset ignored @${display}: no saved name`, { stream: sourceUsername, tiktokId, userKey });
         return;
       }
-      const oldName = record.name;
-      // Remove from queue first if they are currently active.
-      if (record.queued || isInQueue(oldName) || isPlaying(oldName)) {
-        await refreshLiveQueueFromServer();
+
+      // Remove from the website queue/playing if that saved name is active.
+      await refreshLiveQueueFromServer();
+      if (isInQueue(oldName) || isPlaying(oldName)) {
         await removeFromQueue(oldName);
         await refreshLiveQueueFromServer();
       }
-      users[userKey] = { name: '', queued: false };
+
+      const oldCanonical = canonicalName(oldName);
+      const resetStamp = new Date().toISOString();
+
+      // IMPORTANT:
+      // Do not delete keys, because saveUsers() merges with the disk copy.
+      // Deleting a key can make the old disk record come back.
+      // Instead, save an empty tombstone record for every possible alias and old duplicate.
+      for (const key of aliasKeys) {
+        users[key] = { name: '', queued: false, resetAt: resetStamp };
+      }
+
+      for (const [key, value] of Object.entries(users)) {
+        const rec = getRecord(users, key);
+        if (rec.name && oldCanonical && canonicalName(rec.name) === oldCanonical) {
+          users[key] = { name: '', queued: false, resetAt: resetStamp };
+        }
+      }
+
       saveUsers(users);
-      respond(tiktokId, `Saved name "${oldName}" cleared. Type: queue YourNewUbisoftName to rejoin.`, sourceUsername);
-      ok(`[${sourceUsername}] [!r] @${display} reset saved name ${oldName}`);
-      postAdminLog('info', 'queue', `@${display} reset saved name ${oldName}`, { stream: sourceUsername, tiktokId, name: oldName });
+      await refreshLiveQueueFromServer();
+
+      respond(tiktokId, `Saved name "${oldName}" cleared. Type: queue YourNewUbisoftName before using queue by itself.`, sourceUsername);
+      ok(`[${sourceUsername}] [reset] @${display} cleared saved name ${oldName}`);
+      postAdminLog('success', 'queue', `@${display} reset saved name ${oldName}`, {
+        stream: sourceUsername,
+        tiktokId,
+        userKey,
+        name: oldName,
+        aliasesCleared: [...aliasKeys],
+      });
       postBotStatusToServer().catch(() => {});
       return;
     }
 
-    // ── !l — leave queue ─────────────────────────────────────────────────────
+    // ── leave — leave queue ─────────────────────────────────────────────────────
     if (isLeaveCmd) {
       await refreshLiveQueueFromServer();
       const record = getRecord(users, userKey);
       const nameToRemove = record.name;
       if (!nameToRemove || (!isInQueue(nameToRemove) && !isPlaying(nameToRemove))) {
         respond(tiktokId, 'You are not currently in the queue.', sourceUsername);
-        cmd(`[${sourceUsername}] [!l] @${display} not in queue`);
-        postAdminLog('warn', 'queue', `@${display} used !l but is not in queue`, { stream: sourceUsername, tiktokId });
+        cmd(`[${sourceUsername}] [leave] @${display} not in queue`);
+        postAdminLog('warn', 'queue', `@${display} used leave but is not in queue`, { stream: sourceUsername, tiktokId });
         return;
       }
       const leaveResult = await removeFromQueue(nameToRemove);
@@ -1591,7 +1643,7 @@ function registerTikTokEvents(entry) {
         saveUsers(users);
         await refreshLiveQueueFromServer();
         respond(tiktokId, `${nameToRemove} has been removed from the queue.`, sourceUsername);
-        ok(`[${sourceUsername}] [!l] @${display} left queue: ${nameToRemove}`);
+        ok(`[${sourceUsername}] [leave] @${display} left queue: ${nameToRemove}`);
         postAdminLog('success', 'queue', `${nameToRemove} left queue from @${display}`, { stream: sourceUsername, tiktokId, name: nameToRemove });
         postBotStatusToServer().catch(() => {});
       } else if (leaveResult === 'not_found') {
@@ -1599,10 +1651,10 @@ function registerTikTokEvents(entry) {
         users[userKey] = { name: nameToRemove, queued: false };
         saveUsers(users);
         respond(tiktokId, 'You are not currently in the queue.', sourceUsername);
-        cmd(`[${sourceUsername}] [!l] @${display} not found on server queue`);
+        cmd(`[${sourceUsername}] [leave] @${display} not found on server queue`);
       } else {
         respond(tiktokId, 'Could not remove you from the queue right now. Try again.', sourceUsername);
-        err(`[${sourceUsername}] [!l] removeFromQueue error for ${nameToRemove}: ${leaveResult}`);
+        err(`[${sourceUsername}] [leave] removeFromQueue error for ${nameToRemove}: ${leaveResult}`);
       }
       return;
     }
@@ -1610,11 +1662,10 @@ function registerTikTokEvents(entry) {
     // Clear/reset chat commands are intentionally disabled. Admin handles removals and saved-name edits.
 
     if (!isJoinCmd && !isBareJoin) return;
-    setCooldown(cooldownKey);
 
     const afterCommand = String(parsedCommand.arg || '').trim();
     if (!afterCommand) {
-      // If they already saved a name, !queue by itself should rejoin them.
+      // If they already saved a name, queue by itself should rejoin them.
       const savedRecord = getRecord(users, userKey);
       if (!savedRecord.name) {
         respond(tiktokId, 'Use queue <YourUbisoftName>. Example: queue Blake', sourceUsername);
@@ -1623,6 +1674,11 @@ function registerTikTokEvents(entry) {
         return;
       }
     }
+
+    // Only start the join cooldown after the command is valid enough to process.
+    // A plain "queue" with no saved name must not lock the user out.
+    setCooldown(cooldownKey);
+
     let record         = getRecord(users, userKey);
     const joinNameFromCommand = afterCommand || record.name || '';
 
@@ -1713,7 +1769,7 @@ function registerTikTokEvents(entry) {
       return;
     }
 
-    respond(tiktokId, 'Use queue <YourUbisoftName> or !queue <YourUbisoftName> to join the queue.', sourceUsername);
+    respond(tiktokId, 'Use queue <YourUbisoftName> to save your name before using queue by itself.', sourceUsername);
     cmd(`[${sourceUsername}] [queue] @${display} — no saved name`);
   };
 
@@ -1751,7 +1807,7 @@ function registerTikTokEvents(entry) {
   });
 
   // Viewer count updates only. Do NOT queue anyone from roomUser/join events.
-  // The bot only adds a player when that TikTok user types queue <UbisoftName> or !queue <UbisoftName> in chat.
+  // The bot only adds a player when that TikTok user types queue <UbisoftName> in chat.
   tiktok.on('roomUser', d => {
     markTikTokEvent(entry);
     if (d?.viewerCount != null) {
