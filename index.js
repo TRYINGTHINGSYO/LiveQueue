@@ -109,6 +109,11 @@ const LIVE_SCAN_MS       = Number(process.env.LIVE_SCAN_MS || 5_000);
 // This fixes the common post-restart-live stale cursor issue.
 const STALE_CONNECTED_MS = Number(process.env.STALE_CONNECTED_MS || 20_000);
 
+// Prevent Missing Cursor from causing an infinite rebuild spam loop.
+// TikTok can return several bad fetch responses while the old live session is closing.
+const REBUILD_COOLDOWN_MS = Number(process.env.REBUILD_COOLDOWN_MS || 15_000);
+const rebuildingUntil = new Map();
+
 // ── Name normalizer (needed for blocklist init below) ───────────────────────
 // Full definition lives later next to the other name helpers; this copy is
 // identical and lets us use it during module-level initialisation.
@@ -1257,6 +1262,22 @@ function disconnectStream(username) {
   updateAggregateBotState();
 }
 
+
+function canRebuildTikTokNow(sourceUsername) {
+  const key = cleanTikTokUsername(sourceUsername);
+  const until = Number(rebuildingUntil.get(key) || 0);
+  const now = Date.now();
+
+  if (until && now < until) {
+    const waitMs = Math.ceil((until - now) / 1000);
+    postAdminLog('warn', 'tiktok', `@${key}: TikTok is still settling after a chat-cursor error. Waiting ${waitMs}s before rebuilding again instead of spam-reconnecting.`);
+    return false;
+  }
+
+  rebuildingUntil.set(key, now + REBUILD_COOLDOWN_MS);
+  return true;
+}
+
 function rebuildTikTokConnections() {
   const wanted = new Set(getStreamUsers());
 
@@ -1724,10 +1745,10 @@ function registerTikTokEvents(entry) {
     entry.lastAnyEventAt = 0;
     updateAggregateBotState();
     warn(`TikTok disconnected @${sourceUsername} — reconnecting in 3 seconds. No redeploy needed.`);
-    postAdminLog('warn', 'tiktok', `TikTok disconnected @${sourceUsername}. Reconnecting in 3 seconds.`);
+    postAdminLog('warn', 'tiktok', `TikTok disconnected @${sourceUsername}. Reconnecting in 8 seconds.`);
     entry.retryDelay = 10_000;
     postBotStatusToServer({ connected: botConnected, connecting: false, error: `@${sourceUsername} disconnected` });
-    scheduleReconnect(sourceUsername, 3_000);
+    scheduleReconnect(sourceUsername, 8_000);
   });
 
   tiktok.on('error', e => {
