@@ -172,7 +172,7 @@ ${C.cyan}${C.bold}╔═══════════════════�
   Users : ${C.yellow}${DATA_FILE}${C.reset}
   Sync  : ${C.green}Admin panel config sync ENABLED${C.reset}
 
-  ${C.dim}Commands: !queue/queue <UbisoftName> to join  •  !queue to rejoin saved name  •  !c or !l to leave  •  !r to reset saved name  •  q/!q disabled  •  bare-name fallback OFF${C.reset}
+  ${C.dim}Commands: !queue/queue <UbisoftName> to join  •  !queue to rejoin saved name  •  !c/!l/!leave to leave  •  !r/!reset to reset saved name  •  q/!q disabled  •  bare-name fallback OFF${C.reset}
 `);
 }
 
@@ -199,14 +199,14 @@ function parseBotCommandMessage(message) {
   // Normalize full-width exclamation and common "!" lookalikes at the start.
   const text = raw.replace(/^！/, '!');
 
-  // Leave queue. Supports !l, !c, /l, /c.
+  // Leave queue. Supports !c, !l, /c, /l, !leave, and leave.
   // Kept strict so normal chat does not accidentally remove people.
-  if (/^[!\/]\s*[lc]\b/i.test(text)) {
+  if (/^(?:[!\/]\s*(?:c|l|leave)|leave)\b/i.test(text)) {
     return { type: 'leave', arg: '', normalizedCommand: '!c' };
   }
 
-  // Reset saved name. Supports !r or /r.
-  if (/^[!\/]\s*r\b/i.test(text)) {
+  // Reset saved name. Supports !r, /r, !reset, /reset, and reset.
+  if (/^(?:[!\/]\s*(?:r|reset)|reset)\b/i.test(text)) {
     return { type: 'reset', arg: '', normalizedCommand: '!r' };
   }
 
@@ -453,6 +453,46 @@ function replaceUsersInMemory(nextUsers) {
   }
 }
 
+function saveUsersExact(nextUsers) {
+  try {
+    const normalized = normalizeUsersObject(nextUsers || {});
+    fs.writeFileSync(DATA_FILE, JSON.stringify(normalized, null, 2));
+    replaceUsersInMemory(normalized);
+    return true;
+  } catch (e) {
+    err('Could not save users.json exactly:', e.message);
+    return false;
+  }
+}
+
+function deleteSavedUserRecords(keysToDelete = []) {
+  const keys = [...new Set(keysToDelete.map(k => normalizeTikTokUsername(displayUserKey(k))).filter(Boolean))];
+  if (!keys.length) return [];
+
+  let disk = {};
+  try {
+    if (fs.existsSync(DATA_FILE)) disk = normalizeUsersObject(JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')));
+  } catch (_) {
+    disk = { ...(users || {}) };
+  }
+
+  const removed = [];
+  for (const rawKey of keys) {
+    const key = normalizeTikTokUsername(displayUserKey(rawKey));
+    if (Object.prototype.hasOwnProperty.call(disk, key)) {
+      delete disk[key];
+      removed.push(key);
+    }
+    if (Object.prototype.hasOwnProperty.call(users, key)) {
+      delete users[key];
+      if (!removed.includes(key)) removed.push(key);
+    }
+  }
+
+  saveUsersExact(disk);
+  return removed;
+}
+
 function reloadUsersFromDisk() {
   try {
     if (!fs.existsSync(DATA_FILE)) return false;
@@ -477,6 +517,40 @@ function getRecord(users, userKey) {
   if (!r) return { name: '', queued: false };
   if (typeof r === 'string') return { name: r, queued: false };
   return { name: r.name || '', queued: Boolean(r.queued) };
+}
+
+function commandIdentityKeys(sourceUsername, rawTikTokId, displayName) {
+  return [...new Set([
+    rawTikTokId,
+    displayName,
+    displayUserKey(rawTikTokId),
+    displayUserKey(displayName),
+  ].map(v => normalizeTikTokUsername(displayUserKey(v))).filter(Boolean))];
+}
+
+function findExistingUserKeyForCommand(identityKeys = []) {
+  const keys = identityKeys.map(k => normalizeTikTokUsername(displayUserKey(k))).filter(Boolean);
+  for (const key of keys) {
+    const rec = getRecord(users, key);
+    if (rec.name) return key;
+  }
+  for (const key of keys) {
+    if (Object.prototype.hasOwnProperty.call(users, key)) return key;
+  }
+  return keys[0] || '';
+}
+
+function findSavedKeysByName(name) {
+  const target = canonicalName(name);
+  if (!target) return [];
+  const out = [];
+  for (const [rawKey, value] of Object.entries(users)) {
+    const rec = recordFromValue(value);
+    if (rec.name && canonicalName(rec.name) === target) {
+      out.push(normalizeTikTokUsername(displayUserKey(rawKey)) || rawKey);
+    }
+  }
+  return [...new Set(out)];
 }
 
 function setRecord(users, userKey, record) {
@@ -1513,7 +1587,7 @@ function registerTikTokEvents(entry) {
   const handleChatCommand = async (data, eventName = 'chat') => {
     const rawTikTokId = normalizeTikTokUsername(data?.uniqueId || data?.user?.uniqueId || data?.userId || data?.user?.id || '');
     const tiktokId = rawTikTokId;
-    const userKey = streamUserKey(sourceUsername, rawTikTokId);
+    let userKey = streamUserKey(sourceUsername, rawTikTokId);
     const display  = data?.nickname || data?.user?.nickname || data?.uniqueId || rawTikTokId;
     const msg      = String(data?.comment || data?.text || data?.content || data?.msg || '').trim();
     const lower    = msg.toLowerCase();
@@ -1522,6 +1596,11 @@ function registerTikTokEvents(entry) {
 
     // Pick up admin edits/deletes to saved TikTok names without restarting the bot.
     reloadUsersFromDisk();
+
+    // TikTok sometimes reports a different uniqueId/display name after account changes.
+    // Resolve commands against any saved alias so !c / !l / !r operate on the real saved record.
+    const identityKeys = commandIdentityKeys(sourceUsername, rawTikTokId, display);
+    userKey = findExistingUserKeyForCommand(identityKeys) || userKey;
 
     // ── Mirror every raw message to the server for live monitoring ────────────
     // This runs BEFORE any command filtering so you can see exactly what TikTok
@@ -1587,11 +1666,16 @@ function registerTikTokEvents(entry) {
         await removeFromQueue(oldName);
         await refreshLiveQueueFromServer();
       }
-      users[userKey] = { name: '', queued: false };
-      saveUsers(users);
-      respond(tiktokId, `Saved name "${oldName}" cleared. Type: queue YourNewUbisoftName to rejoin.`, sourceUsername);
-      ok(`[${sourceUsername}] [!r] @${display} reset saved name ${oldName}`);
-      postAdminLog('info', 'queue', `@${display} reset saved name ${oldName}`, { stream: sourceUsername, tiktokId, name: oldName });
+
+      // Delete every likely alias for this TikTok account AND any duplicate saved record
+      // with the same Ubisoft name. This fixes cases like @blaker / @fsblaker where
+      // TikTok reports a different account key than the admin saved-name list shows.
+      const keysToClear = [...identityKeys, userKey, ...findSavedKeysByName(oldName)];
+      const removedKeys = deleteSavedUserRecords(keysToClear);
+
+      respond(tiktokId, `Saved name "${oldName}" cleared. Type: !queue YourNewUbisoftName to rejoin.`, sourceUsername);
+      ok(`[${sourceUsername}] [!r] @${display} reset saved name ${oldName} (${removedKeys.length} saved record(s) cleared)`);
+      postAdminLog('info', 'queue', `@${display} reset saved name ${oldName}`, { stream: sourceUsername, tiktokId, name: oldName, removedKeys });
       postBotStatusToServer().catch(() => {});
       return;
     }
