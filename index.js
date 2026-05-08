@@ -102,9 +102,12 @@ function getSessionIdForUsername(username) {
 // These are mutable — overwritten when server config is fetched.
 let POLL_MS        = Number(process.env.POLL_MS      || 5_000);
 let COOLDOWN_MS    = Number(process.env.COOLDOWN_MS  || 8_000);
-let MAX_RETRY_MS   = Number(process.env.MAX_RETRY_MS || 120_000);
-const CONNECT_TIMEOUT_MS = Number(process.env.CONNECT_TIMEOUT_MS || 45_000);
-const LIVE_SCAN_MS       = Number(process.env.LIVE_SCAN_MS || 15_000);
+let MAX_RETRY_MS   = Number(process.env.MAX_RETRY_MS || 30_000);
+const CONNECT_TIMEOUT_MS = Number(process.env.CONNECT_TIMEOUT_MS || 20_000);
+const LIVE_SCAN_MS       = Number(process.env.LIVE_SCAN_MS || 5_000);
+// If TikTok says it is connected but stops sending room/chat events, rebuild the connection.
+// This fixes the common post-restart-live stale cursor issue.
+const STALE_CONNECTED_MS = Number(process.env.STALE_CONNECTED_MS || 20_000);
 
 // ── Name normalizer (needed for blocklist init below) ───────────────────────
 // Full definition lives later next to the other name helpers; this copy is
@@ -150,77 +153,6 @@ const err  = (...a) => log('ERR  ', C.red, ...a);
 const cmd  = (...a) => log('CMD  ', C.magenta, ...a);
 const poll = (...a) => log('POLL ', C.blue, ...a);
 
-function safeStringify(value) {
-  try {
-    if (value === undefined || value === null) return '';
-    if (typeof value === 'string') return value;
-    if (value instanceof Error) return value.message || value.name || 'Error';
-    return JSON.stringify(value, (key, val) => {
-      if (val instanceof Error) return { name: val.name, message: val.message, stack: val.stack };
-      if (typeof val === 'function') return undefined;
-      return val;
-    });
-  } catch (_) {
-    return String(value || 'unknown error');
-  }
-}
-
-function cleanTikTokErrorMessage(error) {
-  const candidates = [
-    error?.message,
-    error?.info,
-    error?.error,
-    error?.exception?.message,
-    error?.exception?.info,
-    error?.cause?.message,
-  ].filter(v => v !== undefined && v !== null && String(v).trim());
-
-  let text = candidates.length ? String(candidates[0]) : safeStringify(error);
-  text = String(text || 'unknown error').trim();
-
-  // Never show the useless JavaScript object string in the admin panel.
-  if (!text || text === '[object Object]' || text === '{}') {
-    const json = safeStringify(error);
-    text = json && json !== '{}' && json !== '[object Object]' ? json : 'TikTok returned an empty connection error';
-  }
-
-  if (/LIVE has ended/i.test(text)) return 'Live is not active or has ended';
-  if (/Error while connecting/i.test(text)) return 'TikTok refused the live connection attempt';
-  if (/roomId|room id/i.test(text)) return text;
-  return text;
-}
-
-function tikTokErrorHelp(error) {
-  const raw = [
-    error?.message,
-    error?.info,
-    error?.error,
-    error?.exception?.message,
-    safeStringify(error),
-  ].join(' ');
-
-  if (/LIVE has ended|not active|has ended/i.test(raw)) {
-    return 'Live is offline. The bot will stay armed and auto-connect when the stream starts.';
-  }
-  if (/Error while connecting/i.test(raw)) {
-    return 'TikTok rejected the connection. This often happens when the account is not live, the live is private, or TikTok is rate-limiting the connection.';
-  }
-  if (/session/i.test(raw)) {
-    return 'Session/cookie may be invalid. Refresh the TikTok session ID if this keeps happening while the live is active.';
-  }
-  return 'The bot will keep retrying automatically.';
-}
-
-function shouldLogStreamError(entry, message) {
-  const key = String(message || '').toLowerCase();
-  const now = Date.now();
-  if (entry.lastStreamErrorKey === key && now - Number(entry.lastStreamErrorAt || 0) < 10_000) return false;
-  entry.lastStreamErrorKey = key;
-  entry.lastStreamErrorAt = now;
-  return true;
-}
-
-
 function printBanner() {
   console.log(`
 ${C.cyan}${C.bold}╔══════════════════════════════════════════╗
@@ -235,7 +167,7 @@ ${C.cyan}${C.bold}╔═══════════════════�
   Users : ${C.yellow}${DATA_FILE}${C.reset}
   Sync  : ${C.green}Admin panel config sync ENABLED${C.reset}
 
-  ${C.dim}Commands: !queue/queue <UbisoftName> to join  •  !l to leave queue  •  !r to reset saved name  •  q/!q disabled  •  bare-name fallback OFF${C.reset}
+  ${C.dim}Commands: !queue/queue <UbisoftName> to join  •  !queue to rejoin saved name  •  !c or !l to leave  •  !r to reset saved name  •  q/!q disabled  •  bare-name fallback OFF${C.reset}
 `);
 }
 
@@ -251,6 +183,64 @@ ${C.cyan}${C.bold}╔═══════════════════�
 const JOIN_COMMAND_RE = /^(?:!queue|queue)\s+/i;
 const CLEAR_COMMAND_RE = /a^/;
 const RESET_COMMAND_RE = /a^/;
+
+// TikTok users often mistype !queue as 1queue, lqueue, Iqueue, or |queue.
+// Also, TikTok/mobile users often type !queueName with no space.
+// This parser accepts those safe variants while still blocking random bare chat.
+function parseBotCommandMessage(message) {
+  const raw = String(message || '').trim();
+  if (!raw) return { type: '', arg: '', normalizedCommand: '' };
+
+  // Normalize full-width exclamation and common "!" lookalikes at the start.
+  const text = raw.replace(/^！/, '!');
+
+  // Leave queue. Supports !l, !c, /l, /c.
+  // Kept strict so normal chat does not accidentally remove people.
+  if (/^[!\/]\s*[lc]\b/i.test(text)) {
+    return { type: 'leave', arg: '', normalizedCommand: '!c' };
+  }
+
+  // Reset saved name. Supports !r or /r.
+  if (/^[!\/]\s*r\b/i.test(text)) {
+    return { type: 'reset', arg: '', normalizedCommand: '!r' };
+  }
+
+  // Join command variants:
+  //   !queue Name
+  //   queue Name
+  //   !queueName
+  //   1queue Name      (common TikTok typo for !queue)
+  //   lqueue Name      (lowercase L typo for !queue)
+  //   Iqueue Name      (uppercase i typo for !queue)
+  //   |queue Name      (pipe typo for !queue)
+  //
+  // Plain "queueName" without !/1/l/I/| is intentionally NOT accepted because
+  // it can catch normal words like "queued". No-space is only allowed when the
+  // user typed a command-looking prefix.
+  const m = text.match(/^([!1lI|]?queue)(.*)$/i);
+  if (!m) return { type: '', arg: '', normalizedCommand: '' };
+
+  const token = m[1] || '';
+  const tail = m[2] || '';
+  const hasCommandPrefix = /^[!1lI|]/.test(token);
+
+  // Exact "queue" / "!queue" means use saved name.
+  if (tail.length === 0) {
+    return { type: 'join', arg: '', normalizedCommand: '!queue' };
+  }
+
+  // Normal format: queue Name / !queue Name / 1queue Name.
+  if (/^\s+/.test(tail)) {
+    return { type: 'join', arg: tail.trim(), normalizedCommand: '!queue' };
+  }
+
+  // No-space format is accepted only for prefixed variants like !queueName or 1queueName.
+  if (hasCommandPrefix && /^[A-Za-z0-9_.-]/.test(tail)) {
+    return { type: 'join', arg: tail.trim(), normalizedCommand: '!queue' };
+  }
+
+  return { type: '', arg: '', normalizedCommand: '' };
+}
 
 
 // Bare-name mode is OFF by default so normal TikTok chat words do not get saved as Ubisoft names.
@@ -1237,7 +1227,7 @@ function ensureStream(username) {
   const entry = {
     username,
     conn: null,
-    retryDelay: 15_000,
+    retryDelay: 10_000,
     reconnectTimer: null,
     connectTimeout: null,
     connecting: false,
@@ -1245,8 +1235,8 @@ function ensureStream(username) {
     currentViewers: 0,
     currentRoomId: null,
     lastConnectAttempt: 0,
-    lastStreamErrorKey: '',
-    lastStreamErrorAt: 0,
+    lastAnyEventAt: 0,
+    lastChatAt: 0,
   };
   streams.set(username, entry);
   createFreshTikTokConnection(entry);
@@ -1292,7 +1282,7 @@ function scheduleReconnect(username, delayMs) {
   if (!getStreamUsers().includes(username)) return;
   const entry = ensureStream(username);
   if (!entry) return;
-  const safeDelay = Math.max(5_000, Number(delayMs || 15_000));
+  const safeDelay = Math.min(MAX_RETRY_MS, Math.max(3_000, Number(delayMs || 10_000)));
   if (entry.reconnectTimer) clearTimeout(entry.reconnectTimer);
   entry.reconnectTimer = setTimeout(() => {
     entry.reconnectTimer = null;
@@ -1336,9 +1326,11 @@ function connectTikTok(username) {
       if (entry.connectTimeout) clearTimeout(entry.connectTimeout);
       entry.connectTimeout = null;
       entry.connecting = false;
-      entry.retryDelay = 15_000;
+      entry.retryDelay = 10_000;
       entry.connected = true;
       entry.currentRoomId = state?.roomId ? String(state.roomId) : null;
+      entry.lastAnyEventAt = Date.now();
+      entry.lastChatAt = 0;
       ok(`Connected to TikTok Live @${entry.username}`);
       postAdminLog('success', 'tiktok', `Connected to TikTok Live @${entry.username}`, { roomId: entry.currentRoomId });
       if (state?.roomId) info(`@${entry.username} Room ID: ${state.roomId}`);
@@ -1352,32 +1344,19 @@ function connectTikTok(username) {
       entry.connected = false;
       entry.currentRoomId = null;
       const hint = e?.exception?.retryAfter ?? e?.retryAfter;
-      const delay = hint ? hint * 1_000 : entry.retryDelay;
-      entry.retryDelay = Math.min(entry.retryDelay * 2, MAX_RETRY_MS);
+      // TikTok sometimes returns retryAfter: 120 after a short hiccup.
+      // That made the bot go silent for about 2 minutes. Cap every retry.
+      const hintedDelay = hint ? Number(hint) * 1_000 : entry.retryDelay;
+      const delay = Math.min(MAX_RETRY_MS, Math.max(3_000, Number(hintedDelay || entry.retryDelay || 10_000)));
+      entry.retryDelay = Math.min(Math.max(10_000, entry.retryDelay * 2), MAX_RETRY_MS);
       updateAggregateBotState();
 
-      const message = cleanTikTokErrorMessage(e);
-      const help = tikTokErrorHelp(e);
-      const retrySeconds = Math.round(delay / 1000);
-      const isOffline = /not active|ended|offline/i.test(message + ' ' + help);
-      const logType = isOffline ? 'warn' : 'error';
-
-      const adminMessage = `@${entry.username}: ${message}. ${help} Retrying in ${retrySeconds}s.`;
-      if (isOffline) warn(adminMessage);
-      else err(`TikTok connect failed — ${adminMessage}`);
-
-      postAdminLog(logType, 'tiktok', adminMessage, {
-        stream: entry.username,
-        retrySeconds,
-        raw: safeStringify(e),
-      });
-
-      if (!getSessionIdForUsername(entry.username)) {
-        warn(`Tip: set a sessionid for @${entry.username}. Use TIKTOK_SESSION_ID for primary, TIKTOK_SESSION_ID_2 for the second stream, or TIKTOK_SESSION_IDS=username=sessionid.`);
-      }
-
-      info(`Keeping @${entry.username} armed. Retrying in ${retrySeconds}s — no redeploy needed when the live starts.`);
-      postAdminLog('info', 'tiktok', `Keeping @${entry.username} armed. Retrying in ${retrySeconds}s`, { stream: entry.username });
+      const message = safeTikTokErrorMessage(e);
+      err(`TikTok connect failed for @${entry.username}: ${message}`);
+      postAdminLog('error', 'tiktok', `TikTok connect failed for @${entry.username}: ${message}`);
+      if (!getSessionIdForUsername(entry.username)) warn(`Tip: set a sessionid for @${entry.username}. Use TIKTOK_SESSION_ID for primary, TIKTOK_SESSION_ID_2 for the second stream, or TIKTOK_SESSION_IDS=username=sessionid.`);
+      info(`Keeping @${entry.username} armed. Retrying in ${Math.round(delay / 1000)}s so you do NOT have to redeploy when that live starts.`);
+      postAdminLog('info', 'tiktok', `Keeping @${entry.username} armed. Retrying in ${Math.round(delay / 1000)}s`);
       postBotStatusToServer({ connected: botConnected, connecting: false, error: `@${entry.username}: ${message}` });
       scheduleReconnect(entry.username, delay);
     });
@@ -1418,6 +1397,11 @@ function keepTikTokConnectionsAlive() {
       try { if (entry.conn) entry.conn.disconnect(); } catch (_) {}
     }
 
+    if (entry.connected && entry.lastAnyEventAt && now - entry.lastAnyEventAt > STALE_CONNECTED_MS) {
+      forceFreshTikTokReconnect(entry.username, `connected but no TikTok room/chat events for ${Math.round((now - entry.lastAnyEventAt) / 1000)}s`, 3_000);
+      continue;
+    }
+
     if (!entry.connected && !entry.connecting && !entry.reconnectTimer) {
       info(`Live scanner: @${entry.username} is not connected — checking again now.`);
       connectTikTok(entry.username);
@@ -1430,6 +1414,63 @@ setInterval(keepTikTokConnectionsAlive, LIVE_SCAN_MS);
 // tiktok-live-connector is read-only; this logs what the bot would say.
 function respond(tiktokId, message, sourceUsername = '') {
   log('CHAT ←', C.cyan, `${sourceUsername ? '[' + sourceUsername + '] ' : ''}@${tiktokId}: ${message}`);
+}
+
+function safeTikTokErrorMessage(e) {
+  if (!e) return 'unknown TikTok error';
+  if (typeof e === 'string') return e;
+  if (e.message) return String(e.message);
+  if (e.info) return String(e.info);
+  if (e.error) return safeTikTokErrorMessage(e.error);
+  try {
+    const json = JSON.stringify(e);
+    return json && json !== '{}' ? json : 'TikTok returned an empty error object';
+  } catch (_) {
+    return String(e);
+  }
+}
+
+function shouldHardReconnectTikTok(message) {
+  const m = String(message || '').toLowerCase();
+  return m.includes('missing cursor')
+    || m.includes('cursor')
+    || m.includes('fetch response')
+    || m.includes('websocket')
+    || m.includes('socket')
+    || m.includes('econnreset')
+    || m.includes('aborted')
+    || m.includes('terminated')
+    || m.includes('stream ended')
+    || m.includes('live has ended');
+}
+
+function markTikTokEvent(entry) {
+  if (!entry) return;
+  entry.lastAnyEventAt = Date.now();
+}
+
+function forceFreshTikTokReconnect(username, reason, delayMs = 3_000) {
+  username = normalizeTikTokUsername(username);
+  const entry = streams.get(username);
+  if (!entry || !getStreamUsers().includes(username)) return;
+
+  if (entry.reconnectTimer) clearTimeout(entry.reconnectTimer);
+  if (entry.connectTimeout) clearTimeout(entry.connectTimeout);
+  entry.reconnectTimer = null;
+  entry.connectTimeout = null;
+  entry.connecting = false;
+  entry.connected = false;
+  entry.currentRoomId = null;
+
+  try { if (entry.conn) entry.conn.disconnect(); } catch (_) {}
+  createFreshTikTokConnection(entry);
+  updateAggregateBotState();
+
+  const seconds = Math.round(Math.max(0, delayMs) / 1000);
+  warn(`Watchdog: rebuilding TikTok connection @${username} — ${reason}. Reconnecting in ${seconds}s.`);
+  postAdminLog('warn', 'tiktok', `Rebuilding @${username} TikTok chat connection — ${reason}. Reconnecting in ${seconds}s.`, { username, reason });
+  postBotStatusToServer({ connected: botConnected, connecting: false, error: `@${username}: reconnecting — ${reason}` });
+  scheduleReconnect(username, delayMs);
 }
 
 // ── Chat handler ────────────────────────────────────────────────────────────
@@ -1449,6 +1490,8 @@ function registerTikTokEvents(entry) {
     const display  = data?.nickname || data?.user?.nickname || data?.uniqueId || rawTikTokId;
     const msg      = String(data?.comment || data?.text || data?.content || data?.msg || '').trim();
     const lower    = msg.toLowerCase();
+    markTikTokEvent(entry);
+    entry.lastChatAt = Date.now();
 
     // Pick up admin edits/deletes to saved TikTok names without restarting the bot.
     reloadUsersFromDisk();
@@ -1460,9 +1503,10 @@ function registerTikTokEvents(entry) {
 
     const bareJoinName = '';
     const isBareJoin = false;
-    const isJoinCmd  = JOIN_COMMAND_RE.test(msg);
-    const isResetCmd = /^!r\b/i.test(msg);   // !r  — reset saved name
-    const isLeaveCmd = /^!l\b/i.test(msg);   // !l  — leave queue
+    const parsedCommand = parseBotCommandMessage(msg);
+    const isJoinCmd  = parsedCommand.type === 'join';
+    const isResetCmd = parsedCommand.type === 'reset';
+    const isLeaveCmd = parsedCommand.type === 'leave';
     const isCmd = isJoinCmd || isResetCmd || isLeaveCmd;
     if (!isCmd) return;
 
@@ -1563,24 +1607,29 @@ function registerTikTokEvents(entry) {
     if (!isJoinCmd && !isBareJoin) return;
     setCooldown(cooldownKey);
 
-    const afterCommand = msg.replace(JOIN_COMMAND_RE, '').trim();
+    const afterCommand = String(parsedCommand.arg || '').trim();
     if (!afterCommand) {
-      respond(tiktokId, 'Use queue <YourUbisoftName> or !queue <YourUbisoftName>.', sourceUsername);
-      cmd(`[${sourceUsername}] [queue] @${display} missing Ubisoft name`);
-      postAdminLog('warn', 'queue', `Rejected @${display}: missing Ubisoft name`, { stream: sourceUsername, tiktokId });
-      return;
+      // If they already saved a name, !queue by itself should rejoin them.
+      const savedRecord = getRecord(users, userKey);
+      if (!savedRecord.name) {
+        respond(tiktokId, 'Use !queue <YourUbisoftName>. Example: !queue Blake', sourceUsername);
+        cmd(`[${sourceUsername}] [queue] @${display} missing Ubisoft name`);
+        postAdminLog('warn', 'queue', `Rejected @${display}: missing Ubisoft name`, { stream: sourceUsername, tiktokId });
+        return;
+      }
     }
     let record         = getRecord(users, userKey);
+    const joinNameFromCommand = afterCommand || record.name || '';
 
     await refreshLiveQueueFromServer();
 
     // If older bot versions saved somebody under their TikTok display name
     // instead of their stable @uniqueId, move that record to the stable key.
     // Example from logs: display @tate, stable key buckismain.
-    if (!record.name && afterCommand) {
+    if (!record.name && joinNameFromCommand) {
       const aliasKey = normalizeTikTokUsername(display);
       const aliasRecord = aliasKey && aliasKey !== userKey ? getRecord(users, aliasKey) : { name: '', queued: false };
-      if (aliasRecord.name && canonicalName(aliasRecord.name) === canonicalName(afterCommand)) {
+      if (aliasRecord.name && canonicalName(aliasRecord.name) === canonicalName(joinNameFromCommand)) {
         users[userKey] = aliasRecord;
         delete users[aliasKey];
         saveUsers(users);
@@ -1592,7 +1641,7 @@ function registerTikTokEvents(entry) {
     if (ownNameIsActive(record)) {
       const pos = getPosition(record.name);
       // Determine if the person tried a DIFFERENT name or their same/saved name
-      const triedName = isBareJoin ? bareJoinName : afterCommand;
+      const triedName = isBareJoin ? bareJoinName : joinNameFromCommand;
       const isSameName = !triedName || canonicalName(triedName) === canonicalName(record.name);
       if (isPlaying(record.name)) {
         respond(tiktokId, `${record.name} is currently playing.`, sourceUsername);
@@ -1608,8 +1657,8 @@ function registerTikTokEvents(entry) {
       return;
     }
 
-    if (afterCommand) {
-      const valid = validateName(afterCommand);
+    if (joinNameFromCommand) {
+      const valid = validateName(joinNameFromCommand);
       if (!valid.ok) {
         respond(tiktokId, valid.reason, sourceUsername);
         cmd(`[${sourceUsername}] [queue] @${display} invalid name: "${afterCommand}" (${valid.reason})`);
@@ -1672,37 +1721,34 @@ function registerTikTokEvents(entry) {
     entry.connected = false;
     entry.connecting = false;
     entry.currentRoomId = null;
+    entry.lastAnyEventAt = 0;
     updateAggregateBotState();
-    warn(`TikTok disconnected @${sourceUsername} — reconnecting in 15 seconds. No redeploy needed.`);
-    postAdminLog('warn', 'tiktok', `TikTok disconnected @${sourceUsername}. Reconnecting in 15 seconds.`);
-    entry.retryDelay = 15_000;
+    warn(`TikTok disconnected @${sourceUsername} — reconnecting in 3 seconds. No redeploy needed.`);
+    postAdminLog('warn', 'tiktok', `TikTok disconnected @${sourceUsername}. Reconnecting in 3 seconds.`);
+    entry.retryDelay = 10_000;
     postBotStatusToServer({ connected: botConnected, connecting: false, error: `@${sourceUsername} disconnected` });
-    scheduleReconnect(sourceUsername, 15_000);
+    scheduleReconnect(sourceUsername, 3_000);
   });
 
   tiktok.on('error', e => {
-    const message = cleanTikTokErrorMessage(e);
-    const help = tikTokErrorHelp(e);
-    const offlineLike = /not active|ended|offline|refused the live connection/i.test(message + ' ' + help);
+    const message = safeTikTokErrorMessage(e);
 
-    // A failed connect can fire both the promise catch and the stream error event.
-    // Throttle duplicates so the admin log stays useful instead of spamming [object Object].
-    if (!shouldLogStreamError(entry, message)) return;
+    if (shouldHardReconnectTikTok(message)) {
+      warn(`TikTok chat stalled @${sourceUsername}: ${message}. Rebuilding connection now.`);
+      postAdminLog('warn', 'tiktok', `@${sourceUsername}: TikTok chat stalled (${message}). Rebuilding connection now so messages do not silently stop.`, { stream: sourceUsername, error: message });
+      forceFreshTikTokReconnect(sourceUsername, message, 3_000);
+      return;
+    }
 
-    const fullMessage = `@${sourceUsername}: ${message}. ${help}`;
-    if (offlineLike) warn(`TikTok stream warning — ${fullMessage}`);
-    else err(`TikTok stream error — ${fullMessage}`);
-
-    postAdminLog(offlineLike ? 'warn' : 'error', 'tiktok', fullMessage, {
-      stream: sourceUsername,
-      raw: safeStringify(e),
-    });
+    err(`TikTok stream error @${sourceUsername}: ${message}`);
+    postAdminLog('error', 'tiktok', `TikTok stream error @${sourceUsername}: ${message}`, { stream: sourceUsername, error: message });
     postBotStatusToServer({ connected: botConnected, error: `@${sourceUsername}: ${message}` });
   });
 
   // Viewer count updates only. Do NOT queue anyone from roomUser/join events.
   // The bot only adds a player when that TikTok user types queue <UbisoftName> or !queue <UbisoftName> in chat.
   tiktok.on('roomUser', d => {
+    markTikTokEvent(entry);
     if (d?.viewerCount != null) {
       entry.currentViewers = Number(d.viewerCount);
       updateAggregateBotState();
