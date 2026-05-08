@@ -1419,7 +1419,7 @@ function keepTikTokConnectionsAlive() {
     }
 
     if (entry.connected && entry.lastAnyEventAt && now - entry.lastAnyEventAt > STALE_CONNECTED_MS) {
-      forceFreshTikTokReconnect(entry.username, `connected but no TikTok room/chat events for ${Math.round((now - entry.lastAnyEventAt) / 1000)}s`, 3_000);
+      forceFreshTikTokReconnect(entry.username, `connected but no TikTok room/chat events for ${Math.round((now - entry.lastAnyEventAt) / 1000)}s`, 8_000);
       continue;
     }
 
@@ -1470,10 +1470,16 @@ function markTikTokEvent(entry) {
   entry.lastAnyEventAt = Date.now();
 }
 
-function forceFreshTikTokReconnect(username, reason, delayMs = 3_000) {
+function forceFreshTikTokReconnect(username, reason, delayMs = 8_000) {
   username = normalizeTikTokUsername(username);
   const entry = streams.get(username);
   if (!entry || !getStreamUsers().includes(username)) return;
+
+  // Missing Cursor can fire several times in a row from the same broken TikTok session.
+  // Rebuild once, then cool down instead of spam-rebuilding every few seconds.
+  if (!canRebuildTikTokNow(username)) {
+    return;
+  }
 
   if (entry.reconnectTimer) clearTimeout(entry.reconnectTimer);
   if (entry.connectTimeout) clearTimeout(entry.connectTimeout);
@@ -1489,7 +1495,7 @@ function forceFreshTikTokReconnect(username, reason, delayMs = 3_000) {
 
   const seconds = Math.round(Math.max(0, delayMs) / 1000);
   warn(`Watchdog: rebuilding TikTok connection @${username} — ${reason}. Reconnecting in ${seconds}s.`);
-  postAdminLog('warn', 'tiktok', `Rebuilding @${username} TikTok chat connection — ${reason}. Reconnecting in ${seconds}s.`, { username, reason });
+  postAdminLog('warn', 'tiktok', `@${username}: TikTok chat cursor broke (${reason}). Rebuilding once, then cooling down so it does not spam reconnect. Reconnecting in ${seconds}s.`, { username, reason });
   postBotStatusToServer({ connected: botConnected, connecting: false, error: `@${username}: reconnecting — ${reason}` });
   scheduleReconnect(username, delayMs);
 }
