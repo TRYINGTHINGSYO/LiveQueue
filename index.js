@@ -172,7 +172,7 @@ ${C.cyan}${C.bold}╔═══════════════════�
   Users : ${C.yellow}${DATA_FILE}${C.reset}
   Sync  : ${C.green}Admin panel config sync ENABLED${C.reset}
 
-  ${C.dim}Commands: queue <UbisoftName> to save/join  •  queue to rejoin saved name only if saved  •  leave to leave queue  •  reset to clear saved name  •  NO ! commands  •  bare-name fallback OFF${C.reset}
+  ${C.dim}Commands: queue <UbisoftName> to save/join  •  queue to rejoin saved name  •  leave to leave queue  •  reset to clear saved name  •  NO ! commands  •  bare-name fallback OFF${C.reset}
 `);
 }
 
@@ -198,12 +198,11 @@ function parseBotCommandMessage(message) {
 
   // ONLY allowed chat commands:
   //   queue UbisoftName  = save/add that Ubisoft name
-  //   queue              = add saved Ubisoft name, only if one is saved
-  //   leave              = leave the queue, but keep saved name
-  //   reset              = leave queue if active and clear saved name
+  //   queue              = add saved Ubisoft name
+  //   leave              = leave the queue
+  //   reset              = clear saved Ubisoft name
   //
-  // These are intentionally NOT allowed:
-  //   !queue, !q, q, !c, !l, !r, !reset, !leave, or bare-name fallback.
+  // No !queue, !q, q, !c, !l, !r, !reset, !leave, or bare-name fallback.
   const lower = text.toLowerCase();
 
   if (lower === 'leave') {
@@ -479,6 +478,30 @@ function displayUserKey(key) {
   return parts.length > 1 ? parts.slice(1).join(':') : String(key || '');
 }
 
+// Build a stable key for saved names and cooldowns. TikTok usually gives uniqueId,
+// but if it does not, do NOT store everybody under one shared "unknown" key.
+function safeTikTokIdentity(data, display, sourceUsername = '') {
+  const unique = normalizeTikTokUsername(
+    data?.uniqueId ||
+    data?.user?.uniqueId ||
+    data?.userId ||
+    data?.user?.id ||
+    data?.user?.secUid ||
+    ''
+  );
+  if (unique && unique !== 'unknown') return unique;
+
+  const fallbackDisplay = normalizeTikTokUsername(display || data?.nickname || data?.user?.nickname || '');
+  if (fallbackDisplay && fallbackDisplay !== 'unknown') return `display-${fallbackDisplay}`;
+
+  return `anon-${normalizeTikTokUsername(sourceUsername || 'stream')}`;
+}
+
+function cooldownRemainingMs(key) {
+  const last = cooldowns.get(key) || 0;
+  return Math.max(0, COOLDOWN_MS - (Date.now() - last));
+}
+
 function canonicalName(raw) {
   return normalizeForFilter(raw);
 }
@@ -752,11 +775,9 @@ async function applyAdminSavedNameOverrides() {
       const clean = valid.name;
       const old = getRecord(users, tiktok);
 
-      // If this TikTok account was reset locally, do NOT let stale server overrides
-      // immediately resurrect the old saved name.
-      if (users[tiktok] && typeof users[tiktok] === 'object' && users[tiktok].resetAt && !old.name) {
-        continue;
-      }
+      // If this account was reset locally, do not let a stale admin override
+      // immediately put the old name back.
+      if (users[tiktok] && typeof users[tiktok] === 'object' && users[tiktok].resetAt && !old.name) continue;
 
       if (canonicalName(old.name) === canonicalName(clean)) continue;
 
@@ -798,14 +819,13 @@ async function renamePlayerOnServer(oldName, newName) {
   }
 }
 
-// Reset must clear BOTH places:
-// 1. the bot's local users file
-// 2. the website/admin saved-name override store
-//
-// Without this, reset appears to work, then the next /api/admin/bot-user-overrides
-// sync can put the old Ubisoft name right back.
-async function deleteSavedNameOnServer(tiktokKeys = []) {
+
+// Persist a TikTok -> Ubisoft saved-name match to the website/admin store too.
+// The bot's local DATA_FILE is not enough for the admin Saved Names panel.
+async function saveSavedNameOnServer(tiktokKeys = [], ubisoftName = '') {
   if (!ADMIN_PASSWORD) return false;
+  const cleanName = String(ubisoftName || '').trim();
+  if (!cleanName) return false;
 
   const keys = [...new Set(
     (Array.isArray(tiktokKeys) ? tiktokKeys : [tiktokKeys])
@@ -813,8 +833,35 @@ async function deleteSavedNameOnServer(tiktokKeys = []) {
       .filter(Boolean)
   )];
 
-  let changed = false;
+  let saved = false;
+  for (const tiktok of keys) {
+    try {
+      const r = await fetchWithTimeout(`${BASE_URL}/api/admin/bot-users/update`, {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify({ tiktok, username: tiktok, ubisoft: cleanName, ubisoftName: cleanName, name: cleanName }),
+      }, 6_000);
+      if (r.ok) saved = true;
+      else if (r.status !== 404) {
+        const text = await r.text().catch(() => '');
+        warn(`[saved-name] server save failed for @${tiktok} -> ${cleanName}: ${r.status} ${text}`);
+      }
+    } catch (e) {
+      if (!String(e.message || '').includes('aborted')) warn(`[saved-name] server save network issue for @${tiktok}: ${e.message}`);
+    }
+  }
+  return saved;
+}
 
+async function deleteSavedNameOnServer(tiktokKeys = []) {
+  if (!ADMIN_PASSWORD) return false;
+  const keys = [...new Set(
+    (Array.isArray(tiktokKeys) ? tiktokKeys : [tiktokKeys])
+      .map(k => normalizeTikTokUsername(displayUserKey(k)))
+      .filter(Boolean)
+  )];
+
+  let changed = false;
   for (const tiktok of keys) {
     const attempts = [
       { url: `${BASE_URL}/api/admin/bot-users/delete`, method: 'POST', body: { tiktok, username: tiktok } },
@@ -823,7 +870,6 @@ async function deleteSavedNameOnServer(tiktokKeys = []) {
       { url: `${BASE_URL}/api/admin/bot-user-overrides/delete`, method: 'POST', body: { tiktok, username: tiktok } },
       { url: `${BASE_URL}/api/admin/bot-users/${encodeURIComponent(tiktok)}`, method: 'DELETE', body: null },
     ];
-
     for (const attempt of attempts) {
       try {
         const r = await fetchWithTimeout(attempt.url, {
@@ -831,25 +877,11 @@ async function deleteSavedNameOnServer(tiktokKeys = []) {
           headers: authHeaders(),
           ...(attempt.body ? { body: JSON.stringify(attempt.body) } : {}),
         }, 6_000);
-
-        // 404 just means this server version does not have that route. Try the next route.
         if (r.status === 404) continue;
-
-        if (r.ok) {
-          changed = true;
-          break;
-        }
-
-        const text = await r.text().catch(() => '');
-        warn(`[reset] server saved-name delete route failed ${attempt.method} ${attempt.url}: ${r.status} ${text}`);
-      } catch (e) {
-        if (!String(e.message || '').includes('aborted')) {
-          warn(`[reset] server saved-name delete network issue for @${tiktok}: ${e.message}`);
-        }
-      }
+        if (r.ok) { changed = true; break; }
+      } catch (_) {}
     }
   }
-
   return changed;
 }
 
@@ -1550,12 +1582,12 @@ function registerTikTokEvents(entry) {
 
   // Some TikTok Live connector versions/accounts emit comments as `chat`;
   // others emit them as `comment`. Register BOTH for every stream so every
-  // enabled live can use queue <UbisoftName>. No other chat commands queue players.
+  // enabled live can use queue/!queue <UbisoftName>. No other chat commands queue players.
   const handleChatCommand = async (data, eventName = 'chat') => {
-    const rawTikTokId = normalizeTikTokUsername(data?.uniqueId || data?.user?.uniqueId || data?.userId || data?.user?.id || '');
+    const display  = data?.nickname || data?.user?.nickname || data?.uniqueId || data?.user?.uniqueId || 'unknown';
+    const rawTikTokId = safeTikTokIdentity(data, display, sourceUsername);
     const tiktokId = rawTikTokId;
     const userKey = streamUserKey(sourceUsername, rawTikTokId);
-    const display  = data?.nickname || data?.user?.nickname || data?.uniqueId || rawTikTokId;
     const msg      = String(data?.comment || data?.text || data?.content || data?.msg || '').trim();
     const lower    = msg.toLowerCase();
     markTikTokEvent(entry);
@@ -1600,8 +1632,9 @@ function registerTikTokEvents(entry) {
     // Only rate-limit queue JOIN and RESET commands (leave is always allowed).
     const cooldownKey = `${userKey}:join`;
     if (isJoinCmd && isOnCooldown(cooldownKey)) {
-      cmd(`[${sourceUsername}] [cooldown] @${tiktokId} — ignored join (${COOLDOWN_MS / 1000}s cooldown)`);
-      postAdminLog('warn', 'queue', `Cooldown ignored @${display}`, { stream: sourceUsername, tiktokId });
+      const left = Math.ceil(cooldownRemainingMs(cooldownKey) / 1000);
+      cmd(`[${sourceUsername}] [cooldown] @${display} / key=${userKey} — ignored join (${left}s left, per-user cooldown)`);
+      postAdminLog('warn', 'queue', `Cooldown ignored @${display}: wait ${left}s`, { stream: sourceUsername, tiktokId, userKey, cooldownKey, remainingSeconds: left });
       return;
     }
 
@@ -1615,7 +1648,6 @@ function registerTikTokEvents(entry) {
       }
       setCooldown(resetCooldownKey);
 
-      // Pull the newest disk state first so we do not reset stale memory.
       reloadUsersFromDisk();
 
       const aliasKeys = new Set([
@@ -1630,14 +1662,10 @@ function registerTikTokEvents(entry) {
         normalizeTikTokUsername(data?.user?.nickname || ''),
       ].filter(Boolean));
 
-      // Find any saved name attached to this TikTok account or its old alias keys.
       let oldName = '';
       for (const key of aliasKeys) {
         const rec = getRecord(users, key);
-        if (rec.name) {
-          oldName = rec.name;
-          break;
-        }
+        if (rec.name) { oldName = rec.name; break; }
       }
 
       if (!oldName) {
@@ -1647,7 +1675,6 @@ function registerTikTokEvents(entry) {
         return;
       }
 
-      // Remove from the website queue/playing if that saved name is active.
       await refreshLiveQueueFromServer();
       if (isInQueue(oldName) || isPlaying(oldName)) {
         await removeFromQueue(oldName);
@@ -1657,14 +1684,8 @@ function registerTikTokEvents(entry) {
       const oldCanonical = canonicalName(oldName);
       const resetStamp = new Date().toISOString();
 
-      // IMPORTANT:
-      // Do not delete keys, because saveUsers() merges with the disk copy.
-      // Deleting a key can make the old disk record come back.
-      // Instead, save an empty tombstone record for every possible alias and old duplicate.
-      for (const key of aliasKeys) {
-        users[key] = { name: '', queued: false, resetAt: resetStamp };
-      }
-
+      // Tombstone instead of delete because saveUsers() merges with disk.
+      for (const key of aliasKeys) users[key] = { name: '', queued: false, resetAt: resetStamp };
       for (const [key, value] of Object.entries(users)) {
         const rec = getRecord(users, key);
         if (rec.name && oldCanonical && canonicalName(rec.name) === oldCanonical) {
@@ -1673,23 +1694,12 @@ function registerTikTokEvents(entry) {
       }
 
       saveUsers(users);
-
-      // Also clear the website/admin saved-name override, otherwise the next config sync
-      // can put the old name back and make plain "queue" work again.
       const serverCleared = await deleteSavedNameOnServer([...aliasKeys]);
-      await applyAdminSavedNameOverrides().catch(() => {});
       await refreshLiveQueueFromServer();
 
       respond(tiktokId, `Saved name "${oldName}" cleared. Type: queue YourNewUbisoftName before using queue by itself.`, sourceUsername);
       ok(`[${sourceUsername}] [reset] @${display} cleared saved name ${oldName}`);
-      postAdminLog('success', 'queue', `@${display} reset saved name ${oldName}`, {
-        stream: sourceUsername,
-        tiktokId,
-        userKey,
-        name: oldName,
-        aliasesCleared: [...aliasKeys],
-        serverCleared,
-      });
+      postAdminLog('success', 'queue', `@${display} reset saved name ${oldName}`, { stream: sourceUsername, tiktokId, userKey, name: oldName, aliasesCleared: [...aliasKeys], serverCleared });
       postBotStatusToServer().catch(() => {});
       return;
     }
@@ -1744,7 +1754,6 @@ function registerTikTokEvents(entry) {
     }
 
     // Only start the join cooldown after the command is valid enough to process.
-    // A plain "queue" with no saved name must not lock the user out.
     setCooldown(cooldownKey);
 
     let record         = getRecord(users, userKey);
@@ -1822,11 +1831,12 @@ function registerTikTokEvents(entry) {
       if (result === 'added' || result === 'already') {
         await refreshLiveQueueFromServer();
         setRecord(users, userKey, { name: clean, queued: true });
-        cmd(`[${sourceUsername}] [queue] @${display} saved name after server accepted it: ${clean}`);
+        const serverSaved = await saveSavedNameOnServer([userKey, rawTikTokId], clean);
+        cmd(`[${sourceUsername}] [queue] @${display} saved name after server accepted it: ${clean}${serverSaved ? ' (admin saved)' : ''}`);
         const pos = getPosition(clean) || '?';
         respond(tiktokId, result === 'added' ? `${clean} added to queue! Position: #${pos}` : `${clean} is already in queue at #${pos}.`, sourceUsername);
         ok(`[${sourceUsername}] [queue] @${display} → ${clean} ${result} (#${pos})`);
-        postAdminLog('success', 'queue', `${clean} ${result === 'added' ? 'added to queue' : 'already in queue'} from @${display}`, { stream: sourceUsername, tiktokId, name: clean, position: pos, result });
+        postAdminLog('success', 'queue', `${clean} ${result === 'added' ? 'added to queue' : 'already in queue'} from @${display}`, { stream: sourceUsername, tiktokId, userKey, name: clean, position: pos, result, serverSaved });
       } else {
         // Important: do NOT save the TikTok → Ubisoft name if the website queue rejected it.
         // This stops random TikTok chat words/bad names from getting stuck on the account.
@@ -1875,7 +1885,7 @@ function registerTikTokEvents(entry) {
   });
 
   // Viewer count updates only. Do NOT queue anyone from roomUser/join events.
-  // The bot only adds a player when that TikTok user types queue <UbisoftName> in chat.
+  // The bot only adds a player when that TikTok user types queue <UbisoftName> or !queue <UbisoftName> in chat.
   tiktok.on('roomUser', d => {
     markTikTokEvent(entry);
     if (d?.viewerCount != null) {
