@@ -7,6 +7,7 @@
   },
   "dependencies": {
     "node-fetch": "2.7.0",
-    "tiktok-live-connector": "1.2.3"
+    "tiktok-live-connector": "1.2.3",
+    "tmi.js": "^1.8.5"
   }
 }
