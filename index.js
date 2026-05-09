@@ -1855,9 +1855,16 @@ function registerTikTokEvents(entry) {
       const oldCanonical = canonicalName(oldName);
       const resetStamp = new Date().toISOString();
 
-      // Tombstone instead of delete because saveUsers() merges with disk.
+      // Tombstone only the keys belonging to the platform the user typed from.
+      // Cross-platform keys (e.g. their TikTok key when they reset from Twitch,
+      // or their Twitch key when they reset from TikTok) are left untouched so
+      // their name stays linked on the other platform.
+      const currentPlatformIsTwitch = platform === 'twitch';
       for (const key of aliasKeys) users[key] = { name: '', queued: false, resetAt: resetStamp };
       for (const [key, value] of Object.entries(users)) {
+        // Only wipe keys that belong to the same platform as the reset command.
+        const keyIsTwitch = String(key).startsWith('twitch_');
+        if (keyIsTwitch !== currentPlatformIsTwitch) continue;
         const rec = getRecord(users, key);
         if (rec.name && oldCanonical && canonicalName(rec.name) === oldCanonical) {
           users[key] = { name: '', queued: false, resetAt: resetStamp };
