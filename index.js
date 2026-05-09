@@ -3,6 +3,14 @@
 const { WebcastPushConnection } = require('tiktok-live-connector');
 const fs = require('fs');
 
+// Optional Twitch chat support. Install with: npm install tmi.js
+let tmi = null;
+try {
+  tmi = require('tmi.js');
+} catch (_) {
+  // Safe to ignore unless Twitch is enabled. TikTok-only deployments keep working.
+}
+
 // Prefer Node 18+/22 built-in fetch. Fall back to node-fetch v2 if present.
 let fetchImpl = global.fetch;
 try {
@@ -57,6 +65,14 @@ let EXTRA_TIKTOK_USERNAMES = parseTikTokUserList(
   process.env.EXTRA_TIKTOK_USERNAMES || process.env.TIKTOK_USERNAME_2 || 'barbariandino'
 );
 let TIKTOK_USERNAME_2_ENABLED = envBool(process.env.TIKTOK_USERNAME_2_ENABLED, EXTRA_TIKTOK_USERNAMES.length > 0);
+const TWITCH_CHANNELS = String(process.env.TWITCH_CHANNELS || process.env.TWITCH_CHANNEL || '')
+  .split(',')
+  .map(s => s.trim().replace(/^#/, '').toLowerCase())
+  .filter(Boolean);
+const TWITCH_ENABLED = envBool(process.env.TWITCH_ENABLED, TWITCH_CHANNELS.length > 0);
+const TWITCH_BOT_USERNAME = String(process.env.TWITCH_BOT_USERNAME || '').trim();
+const TWITCH_OAUTH_TOKEN = String(process.env.TWITCH_OAUTH_TOKEN || '').trim();
+
 const BASE_URL       = (process.env.QUEUE_API_URL || 'https://siegequeue.com').replace(/\/api.*$/, '').replace(/\/$/, '');
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || process.env.ADMIN_SECRET || '';
 const SESSION_ID     = process.env.TIKTOK_SESSION_ID || '';
@@ -170,6 +186,7 @@ ${C.cyan}${C.bold}╔═══════════════════�
   Auth  : ${ADMIN_PASSWORD ? `${C.green}✓ set${C.reset}` : `${C.red}✗ missing${C.reset}`}
   Cookie: ${SESSION_ID ? `${C.green}✓ primary set${C.reset}` : `${C.yellow}⚠ primary not set${C.reset}`} | Extra: ${SESSION_ID_2 || SESSION_IDS_BY_USER.size ? `${C.green}✓ set${C.reset}` : `${C.yellow}⚠ not set${C.reset}`}
   Users : ${C.yellow}${DATA_FILE}${C.reset}
+  Twitch: ${TWITCH_ENABLED ? C.green + 'ON ' + C.reset + TWITCH_CHANNELS.map(c => '#' + c).join(', ') : C.red + 'OFF' + C.reset}
   Sync  : ${C.green}Admin panel config sync ENABLED${C.reset}
 
   ${C.dim}Commands: queue <UbisoftName> to save/join (spaces allowed for console players)  •  queue to rejoin saved name  •  leave to leave queue  •  reset to clear saved name  •  NO ! commands  •  bare-name fallback OFF${C.reset}
@@ -471,6 +488,12 @@ function setRecord(users, userKey, record) {
 // They cannot use one Ubisoft name in your queue and a different one in hers.
 function streamUserKey(sourceUsername, tiktokId) {
   return normalizeTikTokUsername(tiktokId || 'unknown');
+}
+
+function platformUserKey(platform, username) {
+  const clean = normalizeTikTokUsername(username || 'unknown');
+  if (!clean || clean === 'unknown') return 'unknown';
+  return platform === 'twitch' ? `twitch_${clean}` : clean;
 }
 
 function displayUserKey(key) {
@@ -1580,6 +1603,8 @@ function forceFreshTikTokReconnect(username, reason, delayMs = 8_000) {
 
 // ── Chat handler ────────────────────────────────────────────────────────────
 
+let sharedQueueCommandHandler = null;
+
 function registerTikTokEvents(entry) {
   const tiktok = entry.conn;
   const sourceUsername = entry.username;
@@ -1588,15 +1613,19 @@ function registerTikTokEvents(entry) {
   // Some TikTok Live connector versions/accounts emit comments as `chat`;
   // others emit them as `comment`. Register BOTH for every stream so every
   // enabled live can use queue/!queue <UbisoftName>. No other chat commands queue players.
-  const handleChatCommand = async (data, eventName = 'chat') => {
-    const display  = data?.nickname || data?.user?.nickname || data?.uniqueId || data?.user?.uniqueId || 'unknown';
-    const rawTikTokId = safeTikTokIdentity(data, display, sourceUsername);
+  const handleChatCommand = async (data, eventName = 'chat', overrides = {}) => {
+    const platform = String(overrides.platform || 'tiktok').toLowerCase();
+    const sourceLabel = String(overrides.sourceUsername || sourceUsername || platform).trim();
+    const display  = overrides.displayName || data?.nickname || data?.user?.nickname || data?.uniqueId || data?.user?.uniqueId || 'unknown';
+    const rawTikTokId = overrides.rawUserId || safeTikTokIdentity(data, display, sourceLabel);
     const tiktokId = rawTikTokId;
-    const userKey = streamUserKey(sourceUsername, rawTikTokId);
+    const userKey = overrides.userKey || (platform === 'twitch' ? platformUserKey('twitch', rawTikTokId) : streamUserKey(sourceLabel, rawTikTokId));
     const msg      = String(data?.comment || data?.text || data?.content || data?.msg || '').trim();
     const lower    = msg.toLowerCase();
-    markTikTokEvent(entry);
-    entry.lastChatAt = Date.now();
+    if (platform === 'tiktok') {
+      markTikTokEvent(entry);
+      entry.lastChatAt = Date.now();
+    }
 
     // Pick up admin edits/deletes to saved TikTok names without restarting the bot.
     reloadUsersFromDisk();
@@ -1604,7 +1633,7 @@ function registerTikTokEvents(entry) {
     // ── Mirror every raw message to the server for live monitoring ────────────
     // This runs BEFORE any command filtering so you can see exactly what TikTok
     // is delivering — whether commands arrive at all, and from whom.
-    mirrorChatMessage({ stream: sourceUsername, tiktokId: rawTikTokId, nickname: display, msg, event: eventName });
+    mirrorChatMessage({ stream: sourceLabel, tiktokId: rawTikTokId, nickname: display, msg, event: eventName });
 
     const bareJoinName = '';
     const isBareJoin = false;
@@ -1615,8 +1644,8 @@ function registerTikTokEvents(entry) {
     const isCmd = isJoinCmd || isResetCmd || isLeaveCmd;
     if (!isCmd) return;
 
-    cmd(`[${sourceUsername}] queue command heard from @${display} / key=${userKey}: ${msg}`);
-    postAdminLog('info', 'queue', `@${display} typed ${msg}`, { stream: sourceUsername, tiktokId });
+    cmd(`[${sourceLabel}] queue command heard from @${display} / key=${userKey}: ${msg}`);
+    postAdminLog('info', 'queue', `@${display} typed ${msg}`, { stream: sourceLabel, platform, tiktokId });
 
     // Prevent duplicate handling if a connector emits both `chat` and `comment`
     // for the same message. Keeps one person from being queued twice.
@@ -1624,13 +1653,13 @@ function registerTikTokEvents(entry) {
     for (const [key, t] of recentCommands) {
       if (now - t > 2500) recentCommands.delete(key);
     }
-    const dedupeKey = `${sourceUsername}|${rawTikTokId}|${lower}`;
+    const dedupeKey = `${platform}|${sourceLabel}|${rawTikTokId}|${lower}`;
     if (recentCommands.has(dedupeKey)) return;
     recentCommands.set(dedupeKey, now);
 
     if (BANNED_TIKTOK_USERS.has(tiktokId)) {
-      cmd(`[${sourceUsername}] [blocked] @${display} tried command: ${msg}`);
-      postAdminLog('warn', 'queue', `Blocked TikTok user @${display} tried ${msg}`, { stream: sourceUsername, tiktokId });
+      cmd(`[${sourceLabel}] [blocked] @${display} tried command: ${msg}`);
+      postAdminLog('warn', 'queue', `Blocked user @${display} tried ${msg}`, { stream: sourceLabel, platform, tiktokId });
       return;
     }
 
@@ -1638,8 +1667,8 @@ function registerTikTokEvents(entry) {
     const cooldownKey = `${userKey}:join`;
     if (isJoinCmd && isOnCooldown(cooldownKey)) {
       const left = Math.ceil(cooldownRemainingMs(cooldownKey) / 1000);
-      cmd(`[${sourceUsername}] [cooldown] @${display} / key=${userKey} — ignored join (${left}s left, per-user cooldown)`);
-      postAdminLog('warn', 'queue', `Cooldown ignored @${display}: wait ${left}s`, { stream: sourceUsername, tiktokId, userKey, cooldownKey, remainingSeconds: left });
+      cmd(`[${sourceLabel}] [cooldown] @${display} / key=${userKey} — ignored join (${left}s left, per-user cooldown)`);
+      postAdminLog('warn', 'queue', `Cooldown ignored @${display}: wait ${left}s`, { stream: sourceLabel, tiktokId, userKey, cooldownKey, remainingSeconds: left });
       return;
     }
 
@@ -1648,24 +1677,26 @@ function registerTikTokEvents(entry) {
     if (isResetCmd) {
       const resetCooldownKey = `${userKey}:reset`;
       if (isOnCooldown(resetCooldownKey)) {
-        cmd(`[${sourceUsername}] [cooldown] @${display} — ignored reset (${COOLDOWN_MS / 1000}s cooldown)`);
+        cmd(`[${sourceLabel}] [cooldown] @${display} — ignored reset (${COOLDOWN_MS / 1000}s cooldown)`);
         return;
       }
       setCooldown(resetCooldownKey);
 
       reloadUsersFromDisk();
 
-      const aliasKeys = new Set([
-        normalizeTikTokUsername(userKey),
-        normalizeTikTokUsername(rawTikTokId),
-        normalizeTikTokUsername(display),
-        normalizeTikTokUsername(data?.uniqueId || ''),
-        normalizeTikTokUsername(data?.user?.uniqueId || ''),
-        normalizeTikTokUsername(data?.userId || ''),
-        normalizeTikTokUsername(data?.user?.id || ''),
-        normalizeTikTokUsername(data?.nickname || ''),
-        normalizeTikTokUsername(data?.user?.nickname || ''),
-      ].filter(Boolean));
+      const aliasKeys = platform === 'twitch'
+        ? new Set([normalizeTikTokUsername(userKey)].filter(Boolean))
+        : new Set([
+            normalizeTikTokUsername(userKey),
+            normalizeTikTokUsername(rawTikTokId),
+            normalizeTikTokUsername(display),
+            normalizeTikTokUsername(data?.uniqueId || ''),
+            normalizeTikTokUsername(data?.user?.uniqueId || ''),
+            normalizeTikTokUsername(data?.userId || ''),
+            normalizeTikTokUsername(data?.user?.id || ''),
+            normalizeTikTokUsername(data?.nickname || ''),
+            normalizeTikTokUsername(data?.user?.nickname || ''),
+          ].filter(Boolean));
 
       let oldName = '';
       for (const key of aliasKeys) {
@@ -1674,9 +1705,9 @@ function registerTikTokEvents(entry) {
       }
 
       if (!oldName) {
-        respond(tiktokId, 'You have no saved name to reset. Type: queue YourUbisoftName to save one. Spaces are allowed for console players.', sourceUsername);
-        cmd(`[${sourceUsername}] [reset] @${display} has no saved name`);
-        postAdminLog('warn', 'queue', `Reset ignored @${display}: no saved name`, { stream: sourceUsername, tiktokId, userKey });
+        respond(tiktokId, 'You have no saved name to reset. Type: queue YourUbisoftName to save one. Spaces are allowed for console players.', sourceLabel);
+        cmd(`[${sourceLabel}] [reset] @${display} has no saved name`);
+        postAdminLog('warn', 'queue', `Reset ignored @${display}: no saved name`, { stream: sourceLabel, tiktokId, userKey });
         return;
       }
 
@@ -1702,9 +1733,9 @@ function registerTikTokEvents(entry) {
       const serverCleared = await deleteSavedNameOnServer([...aliasKeys]);
       await refreshLiveQueueFromServer();
 
-      respond(tiktokId, `Saved name "${oldName}" cleared. Type: queue YourNewUbisoftName before using queue by itself.`, sourceUsername);
-      ok(`[${sourceUsername}] [reset] @${display} cleared saved name ${oldName}`);
-      postAdminLog('success', 'queue', `@${display} reset saved name ${oldName}`, { stream: sourceUsername, tiktokId, userKey, name: oldName, aliasesCleared: [...aliasKeys], serverCleared });
+      respond(tiktokId, `Saved name "${oldName}" cleared. Type: queue YourNewUbisoftName before using queue by itself.`, sourceLabel);
+      ok(`[${sourceLabel}] [reset] @${display} cleared saved name ${oldName}`);
+      postAdminLog('success', 'queue', `@${display} reset saved name ${oldName}`, { stream: sourceLabel, tiktokId, userKey, name: oldName, aliasesCleared: [...aliasKeys], serverCleared });
       postBotStatusToServer().catch(() => {});
       return;
     }
@@ -1715,9 +1746,9 @@ function registerTikTokEvents(entry) {
       const record = getRecord(users, userKey);
       const nameToRemove = record.name;
       if (!nameToRemove || (!isInQueue(nameToRemove) && !isPlaying(nameToRemove))) {
-        respond(tiktokId, 'You are not currently in the queue.', sourceUsername);
-        cmd(`[${sourceUsername}] [leave] @${display} not in queue`);
-        postAdminLog('warn', 'queue', `@${display} used leave but is not in queue`, { stream: sourceUsername, tiktokId });
+        respond(tiktokId, 'You are not currently in the queue.', sourceLabel);
+        cmd(`[${sourceLabel}] [leave] @${display} not in queue`);
+        postAdminLog('warn', 'queue', `@${display} used leave but is not in queue`, { stream: sourceLabel, tiktokId });
         return;
       }
       const leaveResult = await removeFromQueue(nameToRemove);
@@ -1725,19 +1756,19 @@ function registerTikTokEvents(entry) {
         users[userKey] = { name: nameToRemove, queued: false };
         saveUsers(users);
         await refreshLiveQueueFromServer();
-        respond(tiktokId, `${nameToRemove} has been removed from the queue.`, sourceUsername);
-        ok(`[${sourceUsername}] [leave] @${display} left queue: ${nameToRemove}`);
-        postAdminLog('success', 'queue', `${nameToRemove} left queue from @${display}`, { stream: sourceUsername, tiktokId, name: nameToRemove });
+        respond(tiktokId, `${nameToRemove} has been removed from the queue.`, sourceLabel);
+        ok(`[${sourceLabel}] [leave] @${display} left queue: ${nameToRemove}`);
+        postAdminLog('success', 'queue', `${nameToRemove} left queue from @${display}`, { stream: sourceLabel, tiktokId, name: nameToRemove });
         postBotStatusToServer().catch(() => {});
       } else if (leaveResult === 'not_found') {
         // Queue already cleared on website — sync local state
         users[userKey] = { name: nameToRemove, queued: false };
         saveUsers(users);
-        respond(tiktokId, 'You are not currently in the queue.', sourceUsername);
-        cmd(`[${sourceUsername}] [leave] @${display} not found on server queue`);
+        respond(tiktokId, 'You are not currently in the queue.', sourceLabel);
+        cmd(`[${sourceLabel}] [leave] @${display} not found on server queue`);
       } else {
-        respond(tiktokId, 'Could not remove you from the queue right now. Try again.', sourceUsername);
-        err(`[${sourceUsername}] [leave] removeFromQueue error for ${nameToRemove}: ${leaveResult}`);
+        respond(tiktokId, 'Could not remove you from the queue right now. Try again.', sourceLabel);
+        err(`[${sourceLabel}] [leave] removeFromQueue error for ${nameToRemove}: ${leaveResult}`);
       }
       return;
     }
@@ -1751,9 +1782,9 @@ function registerTikTokEvents(entry) {
       // If they already saved a name, queue by itself should rejoin them.
       const savedRecord = getRecord(users, userKey);
       if (!savedRecord.name) {
-        respond(tiktokId, 'Use queue <YourUbisoftName>. Spaces are allowed for console players. Example: queue Blake', sourceUsername);
-        cmd(`[${sourceUsername}] [queue] @${display} missing Ubisoft name`);
-        postAdminLog('warn', 'queue', `Rejected @${display}: missing Ubisoft name`, { stream: sourceUsername, tiktokId });
+        respond(tiktokId, 'Use queue <YourUbisoftName>. Spaces are allowed for console players. Example: queue Blake', sourceLabel);
+        cmd(`[${sourceLabel}] [queue] @${display} missing Ubisoft name`);
+        postAdminLog('warn', 'queue', `Rejected @${display}: missing Ubisoft name`, { stream: sourceLabel, tiktokId });
         return;
       }
     }
@@ -1777,7 +1808,7 @@ function registerTikTokEvents(entry) {
         delete users[aliasKey];
         saveUsers(users);
         record = aliasRecord;
-        cmd(`[${sourceUsername}] [sync] moved saved name ${aliasRecord.name} from @${aliasKey} to @${userKey}`);
+        cmd(`[${sourceLabel}] [sync] moved saved name ${aliasRecord.name} from @${aliasKey} to @${userKey}`);
       }
     }
 
@@ -1787,31 +1818,31 @@ function registerTikTokEvents(entry) {
       const triedName = isBareJoin ? bareJoinName : joinNameFromCommand;
       const isSameName = !triedName || canonicalName(triedName) === canonicalName(record.name);
       if (isPlaying(record.name)) {
-        respond(tiktokId, `${record.name} is currently playing.`, sourceUsername);
+        respond(tiktokId, `${record.name} is currently playing.`, sourceLabel);
       } else if (isSameName) {
         // They re-typed their own name (or queue with no name) - clear "already in queue" message
-        respond(tiktokId, `${record.name} is already in queue${pos ? ` at #${pos}` : ''}.`, sourceUsername);
+        respond(tiktokId, `${record.name} is already in queue${pos ? ` at #${pos}` : ''}.`, sourceLabel);
       } else {
         // They tried a DIFFERENT name while already queued - tell them which name they're under
-        respond(tiktokId, `You are already in queue as ${record.name}${pos ? ` (#${pos})` : ''}. Ask admin to change it.`, sourceUsername);
+        respond(tiktokId, `You are already in queue as ${record.name}${pos ? ` (#${pos})` : ''}. Ask admin to change it.`, sourceLabel);
       }
-      cmd(`[${sourceUsername}] [queue] @${display} already active as ${record.name}`);
-      postAdminLog('warn', 'queue', `Rejected @${display}: already active as ${record.name}`, { stream: sourceUsername, tiktokId, name: record.name });
+      cmd(`[${sourceLabel}] [queue] @${display} already active as ${record.name}`);
+      postAdminLog('warn', 'queue', `Rejected @${display}: already active as ${record.name}`, { stream: sourceLabel, tiktokId, name: record.name });
       return;
     }
 
     if (joinNameFromCommand) {
       const valid = validateName(joinNameFromCommand);
       if (!valid.ok) {
-        respond(tiktokId, valid.reason, sourceUsername);
-        cmd(`[${sourceUsername}] [queue] @${display} invalid name: "${afterCommand}" (${valid.reason})`);
-        postAdminLog('warn', 'queue', `Rejected @${display}: ${valid.reason}`, { stream: sourceUsername, tiktokId, input: afterCommand });
+        respond(tiktokId, valid.reason, sourceLabel);
+        cmd(`[${sourceLabel}] [queue] @${display} invalid name: "${afterCommand}" (${valid.reason})`);
+        postAdminLog('warn', 'queue', `Rejected @${display}: ${valid.reason}`, { stream: sourceLabel, tiktokId, input: afterCommand });
         return;
       }
       let clean = valid.name;
       const knownName = findKnownNameForInput(clean, userKey);
       if (knownName) {
-        if (knownName !== clean) cmd(`[${sourceUsername}] [queue] @${display} normalized ${clean} → ${knownName}`);
+        if (knownName !== clean) cmd(`[${sourceLabel}] [queue] @${display} normalized ${clean} → ${knownName}`);
         clean = knownName;
       }
 
@@ -1819,42 +1850,44 @@ function registerTikTokEvents(entry) {
       // If they already have a saved name, queue <different name> will NOT change the file.
       // They must ask admin to change the saved name first, then use queue <new name>.
       if (record.name && record.name.toLowerCase() !== clean.toLowerCase()) {
-        respond(tiktokId, `Your saved Ubisoft name is ${record.name}. Use queue with that exact name, or ask admin to change it first.`, sourceUsername);
-        cmd(`[${sourceUsername}] [queue] @${display} tried to change ${record.name} → ${clean} without admin edit`);
-        postAdminLog('warn', 'queue', `Rejected @${display}: tried to change saved name ${record.name} → ${clean}`, { stream: sourceUsername, tiktokId });
+        respond(tiktokId, `Your saved Ubisoft name is ${record.name}. Use queue with that exact name, or ask admin to change it first.`, sourceLabel);
+        cmd(`[${sourceLabel}] [queue] @${display} tried to change ${record.name} → ${clean} without admin edit`);
+        postAdminLog('warn', 'queue', `Rejected @${display}: tried to change saved name ${record.name} → ${clean}`, { stream: sourceLabel, tiktokId });
         return;
       }
 
       const takenMsg = nameTakenMessage(clean, userKey);
       if (takenMsg) {
-        respond(tiktokId, takenMsg, sourceUsername);
-        cmd(`[${sourceUsername}] [queue] @${display} ✗ name "${clean}" blocked by name checker`);
-        postAdminLog('warn', 'queue', `Rejected @${display}: ${takenMsg}`, { stream: sourceUsername, tiktokId, name: clean });
+        respond(tiktokId, takenMsg, sourceLabel);
+        cmd(`[${sourceLabel}] [queue] @${display} ✗ name "${clean}" blocked by name checker`);
+        postAdminLog('warn', 'queue', `Rejected @${display}: ${takenMsg}`, { stream: sourceLabel, tiktokId, name: clean });
         return;
       }
       const result = await addToQueue(clean);
       if (result === 'added' || result === 'already') {
         await refreshLiveQueueFromServer();
         setRecord(users, userKey, { name: clean, queued: true });
-        const serverSaved = await saveSavedNameOnServer([userKey, rawTikTokId], clean);
-        cmd(`[${sourceUsername}] [queue] @${display} saved name after server accepted it: ${clean}${serverSaved ? ' (admin saved)' : ''}`);
+        const serverSaved = await saveSavedNameOnServer(overrides.saveKeys || (platform === 'twitch' ? [userKey] : [userKey, rawTikTokId]), clean);
+        cmd(`[${sourceLabel}] [queue] @${display} saved name after server accepted it: ${clean}${serverSaved ? ' (admin saved)' : ''}`);
         const pos = getPosition(clean) || '?';
-        respond(tiktokId, result === 'added' ? `${clean} added to queue! Position: #${pos}` : `${clean} is already in queue at #${pos}.`, sourceUsername);
-        ok(`[${sourceUsername}] [queue] @${display} → ${clean} ${result} (#${pos})`);
-        postAdminLog('success', 'queue', `${clean} ${result === 'added' ? 'added to queue' : 'already in queue'} from @${display}`, { stream: sourceUsername, tiktokId, userKey, name: clean, position: pos, result, serverSaved });
+        respond(tiktokId, result === 'added' ? `${clean} added to queue! Position: #${pos}` : `${clean} is already in queue at #${pos}.`, sourceLabel);
+        ok(`[${sourceLabel}] [queue] @${display} → ${clean} ${result} (#${pos})`);
+        postAdminLog('success', 'queue', `${clean} ${result === 'added' ? 'added to queue' : 'already in queue'} from @${display}`, { stream: sourceLabel, tiktokId, userKey, name: clean, position: pos, result, serverSaved });
       } else {
         // Important: do NOT save the TikTok → Ubisoft name if the website queue rejected it.
         // This stops random TikTok chat words/bad names from getting stuck on the account.
-        respond(tiktokId, `Could not add "${clean}" to the queue. Check the name and try: queue YourUbisoftName`, sourceUsername);
-        err(`[${sourceUsername}] [queue] @${display} → server rejected ${clean}; not saving it`);
-        postAdminLog('error', 'queue', `Server rejected ${clean} from @${display}`, { stream: sourceUsername, tiktokId, name: clean });
+        respond(tiktokId, `Could not add "${clean}" to the queue. Check the name and try: queue YourUbisoftName`, sourceLabel);
+        err(`[${sourceLabel}] [queue] @${display} → server rejected ${clean}; not saving it`);
+        postAdminLog('error', 'queue', `Server rejected ${clean} from @${display}`, { stream: sourceLabel, tiktokId, name: clean });
       }
       return;
     }
 
-    respond(tiktokId, 'Use queue <YourUbisoftName> to save your name before using queue by itself.', sourceUsername);
-    cmd(`[${sourceUsername}] [queue] @${display} — no saved name`);
+    respond(tiktokId, 'Use queue <YourUbisoftName> to save your name before using queue by itself.', sourceLabel);
+    cmd(`[${sourceLabel}] [queue] @${display} — no saved name`);
   };
+
+  sharedQueueCommandHandler = (data, eventName = 'chat', overrides = {}) => handleChatCommand(data, eventName, overrides);
 
   tiktok.on('chat', data => handleChatCommand(data, 'chat'));
   tiktok.on('comment', data => handleChatCommand(data, 'comment'));
@@ -1902,6 +1935,104 @@ function registerTikTokEvents(entry) {
   });
 }
 
+
+// ── Twitch chat support ─────────────────────────────────────────────────────
+
+let twitchClient = null;
+let twitchConnected = false;
+
+function startTwitchChat() {
+  if (!TWITCH_ENABLED) return;
+  if (!TWITCH_CHANNELS.length) {
+    warn('Twitch is enabled but TWITCH_CHANNEL or TWITCH_CHANNELS is empty.');
+    return;
+  }
+  if (!tmi) {
+    warn('Twitch is enabled but tmi.js is not installed. Run: npm install tmi.js');
+    postAdminLog('warn', 'twitch', 'Twitch enabled but tmi.js is not installed. Run npm install tmi.js.');
+    return;
+  }
+  if (twitchClient) return;
+
+  const options = { reconnect: true, secure: true };
+  const identity = TWITCH_BOT_USERNAME && TWITCH_OAUTH_TOKEN
+    ? { username: TWITCH_BOT_USERNAME, password: TWITCH_OAUTH_TOKEN }
+    : undefined;
+
+  twitchClient = new tmi.Client({
+    options,
+    ...(identity ? { identity } : {}),
+    channels: TWITCH_CHANNELS,
+  });
+
+  twitchClient.on('connected', (addr, port) => {
+    twitchConnected = true;
+    ok(`Connected to Twitch chat: ${TWITCH_CHANNELS.map(c => '#' + c).join(', ')}`);
+    postAdminLog('success', 'twitch', `Connected to Twitch chat: ${TWITCH_CHANNELS.map(c => '#' + c).join(', ')}`, { addr, port });
+    postBotStatusToServer({ connected: botConnected || twitchConnected, connecting: false });
+  });
+
+  twitchClient.on('disconnected', reason => {
+    twitchConnected = false;
+    warn(`Twitch chat disconnected: ${reason || 'unknown reason'}`);
+    postAdminLog('warn', 'twitch', `Twitch chat disconnected: ${reason || 'unknown reason'}`);
+    postBotStatusToServer({ connected: botConnected || twitchConnected, connecting: false, error: `Twitch disconnected: ${reason || 'unknown'}` });
+  });
+
+  twitchClient.on('message', async (channel, tags, message, self) => {
+    if (self) return;
+    const twitchUsername = normalizeTikTokUsername(tags?.username || tags?.['display-name'] || 'unknown');
+    if (!twitchUsername || twitchUsername === 'unknown') return;
+
+    const displayName = tags?.['display-name'] || twitchUsername;
+    const channelName = String(channel || '').replace(/^#/, '').toLowerCase();
+    const userKey = platformUserKey('twitch', twitchUsername);
+
+    const data = {
+      uniqueId: twitchUsername,
+      nickname: displayName,
+      comment: String(message || ''),
+      user: { uniqueId: twitchUsername, nickname: displayName },
+    };
+
+    // If TikTok is disabled and no TikTok stream has built the shared handler yet,
+    // create one lightweight fake TikTok entry only to reuse the exact same queue logic.
+    if (!sharedQueueCommandHandler) {
+      const fakeEntry = {
+        username: 'twitch',
+        conn: { on() {}, disconnect() {} },
+        connected: false,
+        connecting: false,
+        currentViewers: 0,
+        currentRoomId: null,
+        lastChatAt: 0,
+        lastAnyEventAt: 0,
+      };
+      registerTikTokEvents(fakeEntry);
+    }
+
+    if (sharedQueueCommandHandler) {
+      await sharedQueueCommandHandler(data, 'twitch-message', {
+        platform: 'twitch',
+        sourceUsername: `twitch:#${channelName}`,
+        rawUserId: twitchUsername,
+        displayName,
+        userKey,
+        saveKeys: [userKey],
+      });
+    }
+  });
+
+  info(`Connecting to Twitch chat: ${TWITCH_CHANNELS.map(c => '#' + c).join(', ')}`);
+  postAdminLog('info', 'twitch', `Connecting to Twitch chat: ${TWITCH_CHANNELS.map(c => '#' + c).join(', ')}`);
+  twitchClient.connect().catch(e => {
+    twitchConnected = false;
+    const message = e?.message || String(e || 'unknown Twitch error');
+    err(`Twitch connect failed: ${message}`);
+    postAdminLog('error', 'twitch', `Twitch connect failed: ${message}`);
+  });
+}
+
 // Build initial stream objects.
 rebuildTikTokConnections();
 
@@ -1911,6 +2042,7 @@ function shutdown(signal) {
   warn(`\nReceived ${signal} — saving state and exiting…`);
   saveUsers(users);
   for (const entry of streams.values()) { try { entry.conn.disconnect(); } catch (_) {} }
+  try { if (twitchClient) twitchClient.disconnect(); } catch (_) {}
   postBotStatusToServer({ connected: false, connecting: false, error: `Shutdown: ${signal}` })
     .finally(() => process.exit(0));
 }
@@ -1940,7 +2072,7 @@ setInterval(() => {
   const knownRecords  = Object.keys(users).length;
   const savedNames    = getSavedUsersForAdmin().length;
   const queued        = getSavedUsersForAdmin().filter(r => r?.queued || r?.active || r?.inQueue || r?.playing).length;
-  info(`Stats — enabled streams: ${getStreamUsers().map(u => '@' + u).join(', ') || 'none'}, saved names: ${savedNames}, known records: ${knownRecords}, queued records: ${queued}, live queue: ${liveQueue.length}, playing: ${livePlaying.length}, viewers: ${currentViewers}`);
+  info(`Stats — enabled streams: ${getStreamUsers().map(u => '@' + u).join(', ') || 'none'}, saved names: ${savedNames}, known records: ${knownRecords}, queued records: ${queued}, live queue: ${liveQueue.length}, playing: ${livePlaying.length}, viewers: ${currentViewers}, twitch: ${twitchConnected ? 'connected' : 'off/disconnected'}`);
 }, 5 * 60_000);
 
 // ── Start ───────────────────────────────────────────────────────────────────
@@ -1952,8 +2084,10 @@ fetchBotConfigFromServer()
   .then(() => {
     ok('[sync] Config loaded from server — starting TikTok connection');
     connectAllTikTok();
+    startTwitchChat();
   })
   .catch(() => {
     warn('[sync] Could not fetch server config (server may be down) — using env defaults');
     connectAllTikTok();
+    startTwitchChat();
   });
