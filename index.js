@@ -65,11 +65,15 @@ let EXTRA_TIKTOK_USERNAMES = parseTikTokUserList(
   process.env.EXTRA_TIKTOK_USERNAMES || process.env.TIKTOK_USERNAME_2 || 'barbariandino'
 );
 let TIKTOK_USERNAME_2_ENABLED = envBool(process.env.TIKTOK_USERNAME_2_ENABLED, EXTRA_TIKTOK_USERNAMES.length > 0);
-const TWITCH_CHANNELS = String(process.env.TWITCH_CHANNELS || process.env.TWITCH_CHANNEL || '')
-  .split(',')
-  .map(s => s.trim().replace(/^#/, '').toLowerCase())
-  .filter(Boolean);
-const TWITCH_ENABLED = envBool(process.env.TWITCH_ENABLED, TWITCH_CHANNELS.length > 0);
+function parseTwitchChannelList(value) {
+  return String(value || '')
+    .split(',')
+    .map(s => s.trim().replace(/^#/, '').toLowerCase())
+    .filter(Boolean);
+}
+
+let TWITCH_CHANNELS = parseTwitchChannelList(process.env.TWITCH_CHANNELS || process.env.TWITCH_CHANNEL || '');
+let TWITCH_ENABLED = envBool(process.env.TWITCH_ENABLED, TWITCH_CHANNELS.length > 0);
 const TWITCH_BOT_USERNAME = String(process.env.TWITCH_BOT_USERNAME || '').trim();
 const TWITCH_OAUTH_TOKEN = String(process.env.TWITCH_OAUTH_TOKEN || '').trim();
 
@@ -177,7 +181,7 @@ const poll = (...a) => log('POLL ', C.blue, ...a);
 function printBanner() {
   console.log(`
 ${C.cyan}${C.bold}╔══════════════════════════════════════════╗
-║       TikTok Queue Bot  •  siegequeue    ║
+║     TikTok/Twitch Queue Bot • siegequeue  ║
 ╚══════════════════════════════════════════╝${C.reset}
   Users : ${C.yellow}${getStreamUsers().length ? getStreamUsers().map(u => '@' + u).join(' + ') : 'none enabled'}${C.reset}
   Main  : ${TIKTOK_USERNAME_ENABLED ? C.green + 'ON ' + C.reset : C.red + 'OFF' + C.reset} @${TIKTOK_USERNAME || 'not set'}
@@ -859,7 +863,15 @@ async function saveSavedNameOnServer(tiktokKeys = [], ubisoftName = '') {
       const r = await fetchWithTimeout(`${BASE_URL}/api/admin/bot-users/update`, {
         method: 'POST',
         headers: authHeaders(),
-        body: JSON.stringify({ tiktok, username: tiktok, ubisoft: cleanName, ubisoftName: cleanName, name: cleanName }),
+        body: JSON.stringify({
+          tiktok,
+          username: tiktok,
+          platform: tiktok.startsWith('twitch_') || tiktok.startsWith('twitch:') ? 'twitch' : 'tiktok',
+          twitchUsername: tiktok.startsWith('twitch_') ? tiktok.replace(/^twitch_/i, '') : '',
+          ubisoft: cleanName,
+          ubisoftName: cleanName,
+          name: cleanName
+        }),
       }, 6_000);
       if (r.ok) saved = true;
       else if (r.status !== 404) {
@@ -993,6 +1005,24 @@ async function fetchBotConfigFromServer() {
       rebuildTikTokConnections();
       connectAllTikTok();
     }
+
+    // Twitch channel settings from the admin panel. Twitch shares the same saved-name JSON,
+    // but each Twitch account is stored with a twitch_ prefix so it never collides with TikTok.
+    const beforeTwitchKey = JSON.stringify({ enabled: TWITCH_ENABLED, channels: TWITCH_CHANNELS });
+    if (cfg.twitchEnabled !== undefined || cfg.twitchChannel !== undefined || cfg.twitchChannels !== undefined) {
+      TWITCH_ENABLED = cfgBool(cfg.twitchEnabled ?? cfg.twitchEnabled, TWITCH_ENABLED);
+      const nextTwitchChannels = Array.isArray(cfg.twitchChannels)
+        ? cfg.twitchChannels.map(String).join(',')
+        : String(cfg.twitchChannel || '').trim();
+      if (nextTwitchChannels || cfg.twitchChannels !== undefined || cfg.twitchChannel !== undefined) {
+        TWITCH_CHANNELS = parseTwitchChannelList(nextTwitchChannels);
+      }
+    }
+    const afterTwitchKey = JSON.stringify({ enabled: TWITCH_ENABLED, channels: TWITCH_CHANNELS });
+    if (afterTwitchKey !== beforeTwitchKey) {
+      info(`[sync] Twitch chat ${TWITCH_ENABLED ? 'enabled' : 'disabled'}: ${TWITCH_CHANNELS.map(c => '#' + c).join(', ') || 'no channels'}`);
+      restartTwitchChat();
+    }
   } catch (e) {
     if (!e.message?.includes('aborted')) warn(`[sync] Config fetch error: ${e.message}`);
   }
@@ -1015,10 +1045,18 @@ function getSavedUsersForAdmin() {
       const queued = pos !== null;
       const active = activeNames.has(name.toLowerCase());
 
+      const displayKey = displayUserKey(tiktok);
+      const isTwitch = String(tiktok).toLowerCase().startsWith('twitch_') || String(tiktok).toLowerCase().startsWith('twitch:');
+      const twitchUsername = isTwitch ? displayKey.replace(/^twitch[_:]/i, '') : '';
+      const tiktokUsername = isTwitch ? '' : displayKey;
+
       return {
         tiktok,
-        tiktokUsername: displayUserKey(tiktok),
-        username: displayUserKey(tiktok),
+        platform: isTwitch ? 'twitch' : 'tiktok',
+        twitchUsername,
+        tiktokUsername,
+        username: isTwitch ? twitchUsername : tiktokUsername,
+        account: isTwitch ? twitchUsername : tiktokUsername,
         ubisoft: name,
         ubisoftName: name,
         name,
@@ -1076,6 +1114,9 @@ async function postBotStatusToServer(extra = {}) {
         error        : extra.error        ?? null,
         viewers      : extra.viewers      ?? currentViewers,
         roomId       : extra.roomId       ?? currentRoomId,
+        twitchEnabled : TWITCH_ENABLED,
+        twitchConnected,
+        twitchChannels: TWITCH_CHANNELS,
         lastActivity : new Date().toISOString(),
         processUptime: Math.floor(process.uptime()),
         // knownUsers is kept for old server/admin builds and now means real saved names.
@@ -1940,6 +1981,20 @@ function registerTikTokEvents(entry) {
 
 let twitchClient = null;
 let twitchConnected = false;
+
+function stopTwitchChat(reason = 'stopped') {
+  if (!twitchClient) return;
+  try { twitchClient.disconnect(); } catch (_) {}
+  twitchClient = null;
+  twitchConnected = false;
+  postAdminLog('warn', 'twitch', `Twitch chat ${reason}`);
+  postBotStatusToServer({ connected: botConnected || twitchConnected, connecting: false, error: `Twitch ${reason}` }).catch(() => {});
+}
+
+function restartTwitchChat() {
+  stopTwitchChat('restarting');
+  startTwitchChat();
+}
 
 function startTwitchChat() {
   if (!TWITCH_ENABLED) return;
