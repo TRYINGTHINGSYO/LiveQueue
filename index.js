@@ -1419,7 +1419,7 @@ function disconnectStream(username) {
 
 
 function canRebuildTikTokNow(sourceUsername) {
-  const key = cleanTikTokUsername(sourceUsername);
+  const key = normalizeTikTokUsername(sourceUsername);
   const until = Number(rebuildingUntil.get(key) || 0);
   const now = Date.now();
 
