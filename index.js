@@ -157,11 +157,15 @@ const CONNECT_TIMEOUT_MS = Number(process.env.CONNECT_TIMEOUT_MS || 20_000);
 const LIVE_SCAN_MS       = Number(process.env.LIVE_SCAN_MS || 5_000);
 // If TikTok says it is connected but stops sending room/chat events, rebuild the connection.
 // This fixes the common post-restart-live stale cursor issue.
-const STALE_CONNECTED_MS = Number(process.env.STALE_CONNECTED_MS || 20_000);
+// NOTE: 20s was too aggressive — busy lives can have natural 20-30s gaps between roomUser/chat
+// pushes, causing needless reconnects that drop messages during the ~8s reconnect window.
+// 90s gives enough headroom while still catching genuinely stale connections.
+const STALE_CONNECTED_MS = Number(process.env.STALE_CONNECTED_MS || 90_000);
 
 // Prevent Missing Cursor from causing an infinite rebuild spam loop.
 // TikTok can return several bad fetch responses while the old live session is closing.
-const REBUILD_COOLDOWN_MS = Number(process.env.REBUILD_COOLDOWN_MS || 15_000);
+// Raised from 15s to 30s to further reduce reconnect-induced message loss.
+const REBUILD_COOLDOWN_MS = Number(process.env.REBUILD_COOLDOWN_MS || 30_000);
 const rebuildingUntil = new Map();
 
 // ── Name normalizer (needed for blocklist init below) ───────────────────────
@@ -2072,6 +2076,14 @@ function registerTikTokEvents(entry) {
 
   tiktok.on('chat', data => handleChatCommand(data, 'chat'));
   tiktok.on('comment', data => handleChatCommand(data, 'comment'));
+
+  // Mark any TikTok activity so the stale-connection watchdog does not fire
+  // during active lives that happen to have a gap in chat/roomUser events.
+  // member = someone joined the live, like = heart tap, gift = gift sent, share = shared the live.
+  tiktok.on('member', () => { if (entry.conn === tiktok) markTikTokEvent(entry); });
+  tiktok.on('like',   () => { if (entry.conn === tiktok) markTikTokEvent(entry); });
+  tiktok.on('gift',   () => { if (entry.conn === tiktok) markTikTokEvent(entry); });
+  tiktok.on('share',  () => { if (entry.conn === tiktok) markTikTokEvent(entry); });
 
   tiktok.on('disconnected', () => {
     if (entry.conn !== tiktok) return; // ignore late disconnects from stale TikTok connection objects
