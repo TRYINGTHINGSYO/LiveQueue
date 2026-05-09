@@ -1077,12 +1077,25 @@ function getSavedUsersForAdmin() {
 
 // Fire-and-forget: send every raw TikTok message to the server ring buffer.
 // Non-critical — never throws, never awaited by the caller.
-function mirrorChatMessage({ stream, tiktokId, nickname, msg, event }) {
+function mirrorChatMessage({ platform = 'tiktok', stream, tiktokId, twitchUsername, username, nickname, msg, event }) {
   if (!ADMIN_PASSWORD) return;
+  const cleanPlatform = String(platform || 'tiktok').toLowerCase() === 'twitch' ? 'twitch' : 'tiktok';
+  const account = username || twitchUsername || tiktokId || '';
   fetchWithTimeout(`${BASE_URL}/api/bot/chat`, {
     method : 'POST',
     headers: authHeaders(),
-    body   : JSON.stringify({ stream, tiktokId, nickname, msg, event, ts: Date.now() }),
+    body   : JSON.stringify({
+      platform: cleanPlatform,
+      stream,
+      username: account,
+      tiktokId: cleanPlatform === 'tiktok' ? account : '',
+      tiktokUsername: cleanPlatform === 'tiktok' ? account : '',
+      twitchUsername: cleanPlatform === 'twitch' ? account : '',
+      nickname,
+      msg,
+      event,
+      ts: Date.now()
+    }),
   }, 4_000).catch(() => {});
 }
 
@@ -1674,7 +1687,16 @@ function registerTikTokEvents(entry) {
     // ── Mirror every raw message to the server for live monitoring ────────────
     // This runs BEFORE any command filtering so you can see exactly what TikTok
     // is delivering — whether commands arrive at all, and from whom.
-    mirrorChatMessage({ stream: sourceLabel, tiktokId: rawTikTokId, nickname: display, msg, event: eventName });
+    mirrorChatMessage({
+      platform,
+      stream: sourceLabel,
+      tiktokId: platform === 'tiktok' ? rawTikTokId : '',
+      twitchUsername: platform === 'twitch' ? rawTikTokId : '',
+      username: rawTikTokId,
+      nickname: display,
+      msg,
+      event: eventName
+    });
 
     const bareJoinName = '';
     const isBareJoin = false;
