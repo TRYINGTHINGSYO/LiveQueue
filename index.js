@@ -1491,18 +1491,22 @@ function connectTikTok(username) {
 
   entry.connecting = true;
   entry.lastConnectAttempt = Date.now();
-  createFreshTikTokConnection(entry);
+  const currentConn = createFreshTikTokConnection(entry);
 
   // If TikTok never answers while the live is offline/starting, do not stay stuck
   // in "connecting" forever. Reset this stream and keep scanning for the live.
   if (entry.connectTimeout) clearTimeout(entry.connectTimeout);
   entry.connectTimeout = setTimeout(() => {
+    // If another reconnect already replaced this connection, this timeout belongs
+    // to an old attempt. Do not let it disconnect the newer connection.
+    if (entry.conn !== currentConn) return;
     if (!entry.connected) {
       warn(`TikTok connect timed out for @${entry.username}. Keeping it armed and trying again.`);
       postAdminLog('warn', 'tiktok', `TikTok connect timed out for @${entry.username}. Retrying.`);
       entry.connecting = false;
       entry.connected = false;
-      try { if (entry.conn) entry.conn.disconnect(); } catch (_) {}
+      entry.conn = null;
+      try { if (currentConn) currentConn.disconnect(); } catch (_) {}
       updateAggregateBotState();
       postBotStatusToServer({ connected: botConnected, connecting: false, error: `@${entry.username}: connect timeout` });
       scheduleReconnect(entry.username, 5_000);
@@ -1514,8 +1518,9 @@ function connectTikTok(username) {
   updateAggregateBotState();
   postBotStatusToServer({ connecting: true, connected: botConnected });
 
-  entry.conn.connect()
+  currentConn.connect()
     .then(state => {
+      if (entry.conn !== currentConn) return;
       if (entry.connectTimeout) clearTimeout(entry.connectTimeout);
       entry.connectTimeout = null;
       entry.connecting = false;
@@ -1531,6 +1536,7 @@ function connectTikTok(username) {
       postBotStatusToServer({ connected: botConnected, connecting: false, roomId: currentRoomId });
     })
     .catch(e => {
+      if (entry.conn !== currentConn) return;
       if (entry.connectTimeout) clearTimeout(entry.connectTimeout);
       entry.connectTimeout = null;
       entry.connecting = false;
@@ -1587,7 +1593,9 @@ function keepTikTokConnectionsAlive() {
       entry.connected = false;
       if (entry.connectTimeout) clearTimeout(entry.connectTimeout);
       entry.connectTimeout = null;
-      try { if (entry.conn) entry.conn.disconnect(); } catch (_) {}
+      const oldConn = entry.conn;
+      entry.conn = null;
+      try { if (oldConn) oldConn.disconnect(); } catch (_) {}
     }
 
     if (entry.connected && entry.lastAnyEventAt && now - entry.lastAnyEventAt > STALE_CONNECTED_MS) {
@@ -1661,13 +1669,17 @@ function forceFreshTikTokReconnect(username, reason, delayMs = 8_000) {
   entry.connected = false;
   entry.currentRoomId = null;
 
-  try { if (entry.conn) entry.conn.disconnect(); } catch (_) {}
-  createFreshTikTokConnection(entry);
+  // Disconnect the broken connection and immediately detach it from this stream.
+  // Old tiktok-live-connector objects can still emit late error/disconnected events;
+  // registerTikTokEvents() ignores those now because entry.conn no longer matches them.
+  const oldConn = entry.conn;
+  entry.conn = null;
+  try { if (oldConn) oldConn.disconnect(); } catch (_) {}
   updateAggregateBotState();
 
   const seconds = Math.round(Math.max(0, delayMs) / 1000);
-  warn(`Watchdog: rebuilding TikTok connection @${username} — ${reason}. Reconnecting in ${seconds}s.`);
-  postAdminLog('warn', 'tiktok', `@${username}: TikTok chat cursor broke (${reason}). Rebuilding once, then cooling down so it does not spam reconnect. Reconnecting in ${seconds}s.`, { username, reason });
+  warn(`Watchdog: scheduling fresh TikTok reconnect @${username} — ${reason}. Reconnecting in ${seconds}s.`);
+  postAdminLog('warn', 'tiktok', `@${username}: TikTok chat cursor broke (${reason}). Scheduling one safe reconnect in ${seconds}s.`, { username, reason });
   postBotStatusToServer({ connected: botConnected, connecting: false, error: `@${username}: reconnecting — ${reason}` });
   scheduleReconnect(username, delayMs);
 }
@@ -1686,6 +1698,7 @@ function registerTikTokEvents(entry) {
   // enabled live can use queue/!queue <UbisoftName>. No other chat commands queue players.
   const handleChatCommand = async (data, eventName = 'chat', overrides = {}) => {
     const platform = String(overrides.platform || 'tiktok').toLowerCase();
+    if (platform === 'tiktok' && entry.conn !== tiktok) return; // ignore late events from stale TikTok connection objects
     const sourceLabel = String(overrides.sourceUsername || sourceUsername || platform).trim();
     const display  = overrides.displayName || data?.nickname || data?.user?.nickname || data?.uniqueId || data?.user?.uniqueId || 'unknown';
     const rawTikTokId = overrides.rawUserId || safeTikTokIdentity(data, display, sourceLabel);
@@ -1973,11 +1986,13 @@ function registerTikTokEvents(entry) {
   tiktok.on('comment', data => handleChatCommand(data, 'comment'));
 
   tiktok.on('disconnected', () => {
+    if (entry.conn !== tiktok) return; // ignore late disconnects from stale TikTok connection objects
     if (entry.connectTimeout) clearTimeout(entry.connectTimeout);
     entry.connectTimeout = null;
     entry.connected = false;
     entry.connecting = false;
     entry.currentRoomId = null;
+    entry.conn = null;
     entry.lastAnyEventAt = 0;
     updateAggregateBotState();
     warn(`TikTok disconnected @${sourceUsername} — reconnecting in 3 seconds. No redeploy needed.`);
@@ -1988,6 +2003,7 @@ function registerTikTokEvents(entry) {
   });
 
   tiktok.on('error', e => {
+    if (entry.conn !== tiktok) return; // ignore late errors from stale TikTok connection objects
     const message = safeTikTokErrorMessage(e);
 
     if (shouldHardReconnectTikTok(message)) {
@@ -2005,6 +2021,7 @@ function registerTikTokEvents(entry) {
   // Viewer count updates only. Do NOT queue anyone from roomUser/join events.
   // The bot only adds a player when that TikTok user types queue <UbisoftName> or !queue <UbisoftName> in chat.
   tiktok.on('roomUser', d => {
+    if (entry.conn !== tiktok) return; // ignore late viewer updates from stale TikTok connection objects
     markTikTokEvent(entry);
     if (d?.viewerCount != null) {
       entry.currentViewers = Number(d.viewerCount);
