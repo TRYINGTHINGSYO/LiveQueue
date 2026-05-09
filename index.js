@@ -85,7 +85,7 @@ let TIKTOK_USERNAME_2_ENABLED = envBool(process.env.TIKTOK_USERNAME_2_ENABLED, E
 function parseTwitchChannelList(value) {
   return String(value || '')
     .split(',')
-    .map(s => s.trim().replace(/^#/, '').toLowerCase())
+    .map(s => s.trim().replace(/^#+/, '').toLowerCase())
     .filter(Boolean);
 }
 
@@ -210,54 +210,45 @@ ${C.cyan}${C.bold}╔═══════════════════�
   Twitch: ${TWITCH_ENABLED ? C.green + 'ON ' + C.reset + TWITCH_CHANNELS.map(c => '#' + c).join(', ') : C.red + 'OFF' + C.reset}
   Sync  : ${C.green}Admin panel config sync ENABLED${C.reset}
 
-  ${C.dim}Commands: queue <UbisoftName> to save/join (spaces allowed for console players)  •  queue to rejoin saved name  •  leave to leave queue  •  reset to clear saved name  •  NO ! commands  •  bare-name fallback OFF${C.reset}
+  ${C.dim}Commands: queue/q <UbisoftName> to save/join  •  queue/q to rejoin saved name  •  leave/l to leave queue  •  clear/c to clear saved name  •  ! versions also work  •  bare-name fallback OFF${C.reset}
 `);
 }
 
 
 // Commands the bot should treat as queue joins.
 // Allowed commands only:
-//   Join: queue Blake, !queue Blake
+// Same command set for TikTok and Twitch because both platforms use parseBotCommandMessage():
 //
-// IMPORTANT:
-//   - q and !q are disabled.
-//   - clear/reset chat commands are disabled. Admin handles removals/edits.
-//   - a Ubisoft name must be included after queue/!queue.
-const JOIN_COMMAND_RE = /^queue\s+/i;
-const CLEAR_COMMAND_RE = /a^/;
-const RESET_COMMAND_RE = /a^/;
+//   Join / rejoin saved name:
+//     queue UbisoftName, !queue UbisoftName, q UbisoftName, !q UbisoftName
+//     queue, !queue, q, !q
+//
+//   Leave the active queue but keep saved Ubisoft name:
+//     leave, !leave, l, !l
+//
+//   Clear saved Ubisoft name/history and remove from queue if active:
+//     clear, !clear, c, !c, reset, !reset, r, !r
+const JOIN_COMMAND_RE = /^(?:!?(?:queue|q))(?:\s+|$)/i;
+const CLEAR_COMMAND_RE = /^!?(?:clear|c|reset|r)$/i;
+const RESET_COMMAND_RE = CLEAR_COMMAND_RE;
 
-// TikTok users often mistype !queue as 1queue, lqueue, Iqueue, or |queue.
-// Also, TikTok/mobile users often type !queueName with no space.
-// This parser accepts those safe variants while still blocking random bare chat.
 function parseBotCommandMessage(message) {
   const text = String(message || '').trim();
   if (!text) return { type: '', arg: '', normalizedCommand: '' };
 
-  // ONLY allowed chat commands:
-  //   queue UbisoftName  = save/add that Ubisoft name
-  //   queue              = add saved Ubisoft name
-  //   leave              = leave the queue
-  //   reset              = clear saved Ubisoft name
-  //
-  // No !queue, !q, q, !c, !l, !r, !reset, !leave, or bare-name fallback.
   const lower = text.toLowerCase();
 
-  if (lower === 'leave') {
+  if (/^!?(?:leave|l)$/.test(lower)) {
     return { type: 'leave', arg: '', normalizedCommand: 'leave' };
   }
 
-  if (lower === 'reset') {
-    return { type: 'reset', arg: '', normalizedCommand: 'reset' };
+  if (CLEAR_COMMAND_RE.test(lower)) {
+    return { type: 'reset', arg: '', normalizedCommand: 'clear' };
   }
 
-  if (lower === 'queue') {
-    return { type: 'join', arg: '', normalizedCommand: 'queue' };
-  }
-
-  const match = text.match(/^queue\s+(.+)$/i);
-  if (match) {
-    return { type: 'join', arg: match[1].trim(), normalizedCommand: 'queue' };
+  const joinMatch = text.match(/^!?(?:queue|q)(?:\s+(.+))?$/i);
+  if (joinMatch) {
+    return { type: 'join', arg: String(joinMatch[1] || '').trim(), normalizedCommand: 'queue' };
   }
 
   return { type: '', arg: '', normalizedCommand: '' };
@@ -1866,8 +1857,6 @@ function registerTikTokEvents(entry) {
       return;
     }
 
-    // Clear/reset chat commands are intentionally disabled. Admin handles removals and saved-name edits.
-
     if (!isJoinCmd && !isBareJoin) return;
 
     const afterCommand = String(parsedCommand.arg || '').trim();
@@ -2053,6 +2042,7 @@ function restartTwitchChat() {
 }
 
 function startTwitchChat() {
+  TWITCH_CHANNELS = parseTwitchChannelList(TWITCH_CHANNELS.join(','));
   if (!TWITCH_ENABLED) return;
   if (!TWITCH_CHANNELS.length) {
     warn('Twitch is enabled but TWITCH_CHANNEL or TWITCH_CHANNELS is empty.');
@@ -2096,7 +2086,7 @@ function startTwitchChat() {
     if (!twitchUsername || twitchUsername === 'unknown') return;
 
     const displayName = tags?.['display-name'] || twitchUsername;
-    const channelName = String(channel || '').replace(/^#/, '').toLowerCase();
+    const channelName = String(channel || '').replace(/^#+/, '').toLowerCase();
     const userKey = platformUserKey('twitch', twitchUsername);
 
     const data = {
