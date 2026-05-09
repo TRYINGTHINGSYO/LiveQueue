@@ -1238,6 +1238,34 @@ function recordFromValue(value) {
   return { name: value.name || '', queued: Boolean(value.queued) };
 }
 
+// Returns true if ownerStorageKey and incomingStorageKey are the same person on
+// different platforms (one is twitch_X, the other is a TikTok key that already
+// has the same Ubisoft name saved).  Used to allow cross-platform name linking
+// instead of falsely reporting "name taken".
+function isCrossPlatformSamePerson(ownerStorageKey, incomingStorageKey, ubisoftName) {
+  const ownerIsTwitch   = String(ownerStorageKey   || '').startsWith('twitch_');
+  const incomingIsTwitch = String(incomingStorageKey || '').startsWith('twitch_');
+
+  // Must be on different platforms to qualify.
+  if (ownerIsTwitch === incomingIsTwitch) return false;
+
+  // The Ubisoft name must actually match — we already know it does at the call-site,
+  // but this makes the helper self-contained.
+  const ownerRec   = recordFromValue(users[ownerStorageKey]);
+  const incomingRec = recordFromValue(users[incomingStorageKey]);
+  if (!ownerRec.name) return false;
+  if (canonicalName(ownerRec.name) !== canonicalName(ubisoftName)) return false;
+
+  // If the incoming key has NO saved name yet, it's a new cross-platform registration
+  // for the same Ubisoft name — allow it.
+  if (!incomingRec.name) return true;
+
+  // If the incoming key already has the SAME Ubisoft name saved, same person — allow.
+  if (canonicalName(incomingRec.name) === canonicalName(ownerRec.name)) return true;
+
+  return false;
+}
+
 function findSavedNameTakenByOther(name, tiktokId) {
   const key = canonicalName(name);
   const ownKey = normalizeTikTokUsername(displayUserKey(tiktokId));
@@ -1250,11 +1278,20 @@ function findSavedNameTakenByOther(name, tiktokId) {
     const rec = recordFromValue(value);
     if (!rec.name) continue;
 
-    // Exact same saved Ubisoft name belongs to a different TikTok account.
-    if (canonicalName(rec.name) === key) return rec.name;
+    // Exact same saved Ubisoft name — check before declaring it taken.
+    if (canonicalName(rec.name) === key) {
+      // If the owner is on a different platform and has no name conflict,
+      // this is the same person registering their name cross-platform — not a conflict.
+      if (isCrossPlatformSamePerson(rawOwner, tiktokId, name)) continue;
+      return rec.name;
+    }
 
-    // Also block obvious copycat versions of another saved Ubisoft name.
-    if (namesAreTooClose(name, rec.name)) return rec.name;
+    // Also block obvious copycat versions of another saved Ubisoft name,
+    // but only if it's not the same person on a different platform.
+    if (namesAreTooClose(name, rec.name)) {
+      if (isCrossPlatformSamePerson(rawOwner, tiktokId, name)) continue;
+      return rec.name;
+    }
   }
 
   return null;
@@ -1958,6 +1995,31 @@ function registerTikTokEvents(entry) {
         cmd(`[${sourceLabel}] [queue] @${display} ✗ name "${clean}" blocked by name checker`);
         postAdminLog('warn', 'queue', `Rejected @${display}: ${takenMsg}`, { stream: sourceLabel, tiktokId, name: clean });
         return;
+      }
+
+      // ── Cross-platform name linking ────────────────────────────────────────
+      // If the same Ubisoft name is already saved under the other platform key
+      // (e.g. TikTok has it, now Twitch is registering it — or vice versa),
+      // adopt the existing canonical name spelling and continue normally.
+      // This lets the same person type queue commands on both platforms.
+      if (!record.name) {
+        for (const [rawOwner, value] of Object.entries(users)) {
+          const ownerKey = normalizeTikTokUsername(displayUserKey(rawOwner));
+          if (!ownerKey || ownerKey === normalizeTikTokUsername(displayUserKey(userKey))) continue;
+          const ownerRec = recordFromValue(value);
+          if (!ownerRec.name) continue;
+          if (canonicalName(ownerRec.name) === canonicalName(clean)) {
+            const ownerIsTwitch   = String(rawOwner).startsWith('twitch_');
+            const incomingIsTwitch = String(userKey).startsWith('twitch_');
+            if (ownerIsTwitch !== incomingIsTwitch) {
+              // Same person on the other platform — adopt their saved name spelling.
+              clean = ownerRec.name;
+              cmd(`[${sourceLabel}] [queue] @${display} cross-platform link: adopting existing name "${clean}" from ${ownerIsTwitch ? 'Twitch' : 'TikTok'} key ${rawOwner}`);
+              postAdminLog('info', 'queue', `@${display} linked cross-platform: adopting "${clean}" from ${rawOwner}`, { stream: sourceLabel, tiktokId, userKey, linkedFrom: rawOwner });
+              break;
+            }
+          }
+        }
       }
       const result = await addToQueue(clean);
       if (result === 'added' || result === 'already') {
