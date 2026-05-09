@@ -109,8 +109,8 @@ const TWITCH_OAUTH_TOKEN = String(process.env.TWITCH_OAUTH_TOKEN || '').trim();
 
 const BASE_URL       = (process.env.QUEUE_API_URL || 'https://siegequeue.com').replace(/\/api.*$/, '').replace(/\/$/, '');
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || process.env.ADMIN_SECRET || '';
-const SESSION_ID     = process.env.TIKTOK_SESSION_ID || '';
-const SESSION_ID_2   = process.env.TIKTOK_SESSION_ID_2 || '';
+const SESSION_ID     = String(process.env.TIKTOK_SESSION_ID || '').trim();
+const SESSION_ID_2   = String(process.env.TIKTOK_SESSION_ID_2 || '').trim();
 const DATA_FILE      = process.env.BOT_USERS_FILE || process.env.USER_DATA_FILE || './users.json';
 
 function parseSessionIdMap(value) {
@@ -1405,12 +1405,27 @@ function setCooldown(key)  { cooldowns.set(key, Date.now()); }
 // or:
 //   EXTRA_TIKTOK_USERNAMES=barbariandino,anotherstreamer
 
+const TIKTOK_REQUEST_TIMEOUT_MS = Number(process.env.TIKTOK_REQUEST_TIMEOUT_MS || 30_000);
+const TIKTOK_WEBSOCKET_TIMEOUT_MS = Number(process.env.TIKTOK_WEBSOCKET_TIMEOUT_MS || 30_000);
+const TIKTOK_USER_AGENT = process.env.TIKTOK_USER_AGENT || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+
 function buildTikTokOptions(username) {
   const sessionId = getSessionIdForUsername(username);
   return {
     enableExtendedGiftInfo  : false,
     enableWebsocketUpgrade  : true,
     requestPollingIntervalMs: 2_000,
+    processInitialData      : true,
+    requestOptions: {
+      timeout: TIKTOK_REQUEST_TIMEOUT_MS,
+      headers: {
+        'user-agent': TIKTOK_USER_AGENT,
+        'accept-language': 'en-US,en;q=0.9',
+      },
+    },
+    websocketOptions: {
+      timeout: TIKTOK_WEBSOCKET_TIMEOUT_MS,
+    },
     ...(sessionId ? { sessionId } : {}),
   };
 }
@@ -1555,8 +1570,9 @@ function connectTikTok(username) {
     }
   }, CONNECT_TIMEOUT_MS);
 
-  info(`Connecting to @${entry.username}…`);
-  postAdminLog('info', 'tiktok', `Connecting to @${entry.username}`);
+  const hasSession = !!getSessionIdForUsername(entry.username);
+  info(`Connecting to @${entry.username}… ${hasSession ? '(sessionid set)' : '(no sessionid)'}`);
+  postAdminLog('info', 'tiktok', `Connecting to @${entry.username}${hasSession ? ' with sessionid' : ' without sessionid'}`);
   updateAggregateBotState();
   postBotStatusToServer({ connecting: true, connected: botConnected });
 
