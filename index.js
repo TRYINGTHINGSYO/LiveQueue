@@ -82,11 +82,24 @@ let EXTRA_TIKTOK_USERNAMES = parseTikTokUserList(
   process.env.EXTRA_TIKTOK_USERNAMES || process.env.TIKTOK_USERNAME_2 || 'barbariandino'
 );
 let TIKTOK_USERNAME_2_ENABLED = envBool(process.env.TIKTOK_USERNAME_2_ENABLED, EXTRA_TIKTOK_USERNAMES.length > 0);
-function parseTwitchChannelList(value) {
+function cleanTwitchChannel(value) {
   return String(value || '')
-    .split(',')
-    .map(s => s.trim().replace(/^#+/, '').toLowerCase())
-    .filter(Boolean);
+    .trim()
+    .replace(/^[@#]+/, '')
+    .toLowerCase();
+}
+
+function parseTwitchChannelList(value) {
+  const raw = Array.isArray(value) ? value : String(value || '').split(',');
+  return [...new Set(raw.map(cleanTwitchChannel).filter(Boolean))];
+}
+
+function twitchChannelsKey(channels = TWITCH_CHANNELS) {
+  return JSON.stringify(parseTwitchChannelList(channels).sort());
+}
+
+function twitchChannelsDisplay(channels = TWITCH_CHANNELS) {
+  return parseTwitchChannelList(channels).map(c => '#' + c).join(', ');
 }
 
 let TWITCH_CHANNELS = parseTwitchChannelList(process.env.TWITCH_CHANNELS || process.env.TWITCH_CHANNEL || '');
@@ -1016,19 +1029,20 @@ async function fetchBotConfigFromServer() {
 
     // Twitch channel settings from the admin panel. Twitch shares the same saved-name JSON,
     // but each Twitch account is stored with a twitch_ prefix so it never collides with TikTok.
-    const beforeTwitchKey = JSON.stringify({ enabled: TWITCH_ENABLED, channels: TWITCH_CHANNELS });
+    const beforeTwitchKey = JSON.stringify({ enabled: Boolean(TWITCH_ENABLED), channels: twitchChannelsKey(TWITCH_CHANNELS) });
     if (cfg.twitchEnabled !== undefined || cfg.twitchChannel !== undefined || cfg.twitchChannels !== undefined) {
-      TWITCH_ENABLED = cfgBool(cfg.twitchEnabled ?? cfg.twitchEnabled, TWITCH_ENABLED);
+      TWITCH_ENABLED = cfgBool(cfg.twitchEnabled, TWITCH_ENABLED);
       const nextTwitchChannels = Array.isArray(cfg.twitchChannels)
-        ? cfg.twitchChannels.map(String).join(',')
-        : String(cfg.twitchChannel || '').trim();
-      if (nextTwitchChannels || cfg.twitchChannels !== undefined || cfg.twitchChannel !== undefined) {
+        ? cfg.twitchChannels
+        : String(cfg.twitchChannel || '').split(',');
+      if (nextTwitchChannels.length || cfg.twitchChannels !== undefined || cfg.twitchChannel !== undefined) {
         TWITCH_CHANNELS = parseTwitchChannelList(nextTwitchChannels);
       }
     }
-    const afterTwitchKey = JSON.stringify({ enabled: TWITCH_ENABLED, channels: TWITCH_CHANNELS });
+    TWITCH_CHANNELS = parseTwitchChannelList(TWITCH_CHANNELS);
+    const afterTwitchKey = JSON.stringify({ enabled: Boolean(TWITCH_ENABLED), channels: twitchChannelsKey(TWITCH_CHANNELS) });
     if (afterTwitchKey !== beforeTwitchKey) {
-      info(`[sync] Twitch chat ${TWITCH_ENABLED ? 'enabled' : 'disabled'}: ${TWITCH_CHANNELS.map(c => '#' + c).join(', ') || 'no channels'}`);
+      info(`[sync] Twitch chat ${TWITCH_ENABLED ? 'enabled' : 'disabled'}: ${twitchChannelsDisplay() || 'no channels'}`);
       restartTwitchChat();
     }
   } catch (e) {
@@ -2027,22 +2041,35 @@ function registerTikTokEvents(entry) {
 let twitchClient = null;
 let twitchConnected = false;
 
-function stopTwitchChat(reason = 'stopped') {
+function stopTwitchChat(reason = 'stopped', opts = {}) {
   if (!twitchClient) return;
-  try { twitchClient.disconnect(); } catch (_) {}
+  const oldClient = twitchClient;
   twitchClient = null;
   twitchConnected = false;
-  postAdminLog('warn', 'twitch', `Twitch chat ${reason}`);
-  postBotStatusToServer({ connected: botConnected || twitchConnected, connecting: false, error: `Twitch ${reason}` }).catch(() => {});
+  try {
+    oldClient.removeAllListeners?.();
+    oldClient.disconnect();
+  } catch (_) {}
+  if (!opts.silent) {
+    postAdminLog('warn', 'twitch', `Twitch chat ${reason}`);
+    postBotStatusToServer({ connected: botConnected || twitchConnected, connecting: false, error: `Twitch ${reason}` }).catch(() => {});
+  }
 }
 
+let twitchRestartTimer = null;
+let twitchStarting = false;
+
 function restartTwitchChat() {
+  if (twitchRestartTimer) clearTimeout(twitchRestartTimer);
   stopTwitchChat('restarting');
-  startTwitchChat();
+  twitchRestartTimer = setTimeout(() => {
+    twitchRestartTimer = null;
+    startTwitchChat();
+  }, 750);
 }
 
 function startTwitchChat() {
-  TWITCH_CHANNELS = parseTwitchChannelList(TWITCH_CHANNELS.join(','));
+  TWITCH_CHANNELS = parseTwitchChannelList(TWITCH_CHANNELS);
   if (!TWITCH_ENABLED) return;
   if (!TWITCH_CHANNELS.length) {
     warn('Twitch is enabled but TWITCH_CHANNEL or TWITCH_CHANNELS is empty.');
@@ -2053,7 +2080,8 @@ function startTwitchChat() {
     postAdminLog('warn', 'twitch', 'Twitch enabled but tmi.js is not installed. Run npm install tmi.js.');
     return;
   }
-  if (twitchClient) return;
+  if (twitchClient || twitchStarting) return;
+  twitchStarting = true;
 
   const options = { reconnect: true, secure: true };
   const identity = TWITCH_BOT_USERNAME && TWITCH_OAUTH_TOKEN
@@ -2066,14 +2094,20 @@ function startTwitchChat() {
     channels: TWITCH_CHANNELS,
   });
 
+  const currentTwitchClient = twitchClient;
+
   twitchClient.on('connected', (addr, port) => {
+    if (twitchClient !== currentTwitchClient) return;
+    twitchStarting = false;
     twitchConnected = true;
-    ok(`Connected to Twitch chat: ${TWITCH_CHANNELS.map(c => '#' + c).join(', ')}`);
-    postAdminLog('success', 'twitch', `Connected to Twitch chat: ${TWITCH_CHANNELS.map(c => '#' + c).join(', ')}`, { addr, port });
+    ok(`Connected to Twitch chat: ${twitchChannelsDisplay()}`);
+    postAdminLog('success', 'twitch', `Connected to Twitch chat: ${twitchChannelsDisplay()}`, { addr, port });
     postBotStatusToServer({ connected: botConnected || twitchConnected, connecting: false });
   });
 
   twitchClient.on('disconnected', reason => {
+    if (twitchClient !== currentTwitchClient) return;
+    twitchStarting = false;
     twitchConnected = false;
     warn(`Twitch chat disconnected: ${reason || 'unknown reason'}`);
     postAdminLog('warn', 'twitch', `Twitch chat disconnected: ${reason || 'unknown reason'}`);
@@ -2081,6 +2115,7 @@ function startTwitchChat() {
   });
 
   twitchClient.on('message', async (channel, tags, message, self) => {
+    if (twitchClient !== currentTwitchClient) return;
     if (self) return;
     const twitchUsername = normalizeTikTokUsername(tags?.username || tags?.['display-name'] || 'unknown');
     if (!twitchUsername || twitchUsername === 'unknown') return;
@@ -2124,9 +2159,11 @@ function startTwitchChat() {
     }
   });
 
-  info(`Connecting to Twitch chat: ${TWITCH_CHANNELS.map(c => '#' + c).join(', ')}`);
-  postAdminLog('info', 'twitch', `Connecting to Twitch chat: ${TWITCH_CHANNELS.map(c => '#' + c).join(', ')}`);
-  twitchClient.connect().catch(e => {
+  info(`Connecting to Twitch chat: ${twitchChannelsDisplay()}`);
+  postAdminLog('info', 'twitch', `Connecting to Twitch chat: ${twitchChannelsDisplay()}`);
+  currentTwitchClient.connect().catch(e => {
+    if (twitchClient !== currentTwitchClient) return;
+    twitchStarting = false;
     twitchConnected = false;
     const message = e?.message || String(e || 'unknown Twitch error');
     err(`Twitch connect failed: ${message}`);
