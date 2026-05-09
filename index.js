@@ -1,5 +1,22 @@
 'use strict';
 
+// Env Twitch force-on guard.
+// If TWITCH_ENABLED=true is set in Railway, admin config sync is not allowed to turn Twitch off.
+// This prevents stale website config from overriding the bot service at startup.
+const TWITCH_ENV_FORCE_ENABLED =
+  String(process.env.TWITCH_ENABLED || '').toLowerCase() === 'true' ||
+  String(process.env.TWITCH_ENABLED || '') === '1' ||
+  String(process.env.TWITCH_ENABLED || '').toLowerCase() === 'yes' ||
+  String(process.env.TWITCH_ENABLED || '').toLowerCase() === 'on';
+
+function boolFromConfigOrEnv(value, fallback = false) {
+  if (TWITCH_ENV_FORCE_ENABLED) return true;
+  if (value === true || value === 'true' || value === 1 || value === '1' || value === 'on' || value === 'yes') return true;
+  if (value === false || value === 'false' || value === 0 || value === '0' || value === 'off' || value === 'no') return false;
+  return fallback;
+}
+
+
 const { WebcastPushConnection } = require('tiktok-live-connector');
 const fs = require('fs');
 
