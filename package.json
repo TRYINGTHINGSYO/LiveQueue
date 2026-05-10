@@ -1,13 +1,14 @@
 {
-  "name": "livequeue",
+  "name": "r6-queue",
   "version": "1.0.0",
-  "main": "index.js",
+  "description": "TikTok/Twitch SiegeQueue chat bot",
+  "main": "server.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node server.js"
   },
   "dependencies": {
-    "node-fetch": "2.7.0",
-    "tiktok-live-connector": "1.2.3",
+    "node-fetch": "^2.7.0",
+    "tiktok-live-connector": "latest",
     "tmi.js": "^1.8.5"
   }
 }
