@@ -16,17 +16,9 @@ function boolFromConfigOrEnv(value, fallback = false) {
   return fallback;
 }
 
-const fs = require('fs');
 
-// TikTok chat support. Keep this optional so a stale Railway build without the
-// dependency does not crash before Twitch/status logging can start.
-let WebcastPushConnection = null;
-let TIKTOK_CONNECTOR_LOAD_ERROR = '';
-try {
-  ({ WebcastPushConnection } = require('tiktok-live-connector'));
-} catch (e) {
-  TIKTOK_CONNECTOR_LOAD_ERROR = e?.message || String(e || 'tiktok-live-connector is not installed');
-}
+const { WebcastPushConnection } = require('tiktok-live-connector');
+const fs = require('fs');
 
 // Optional Twitch chat support. Install with: npm install tmi.js
 let tmi = null;
@@ -220,26 +212,6 @@ const err  = (...a) => log('ERR  ', C.red, ...a);
 const cmd  = (...a) => log('CMD  ', C.magenta, ...a);
 const poll = (...a) => log('POLL ', C.blue, ...a);
 
-let lastTikTokDependencyWarnAt = 0;
-
-function hasTikTokConnector() {
-  return typeof WebcastPushConnection === 'function';
-}
-
-function warnMissingTikTokConnector(context = '') {
-  const now = Date.now();
-  if (now - lastTikTokDependencyWarnAt < 60_000) return;
-  lastTikTokDependencyWarnAt = now;
-
-  const message = 'TikTok dependency missing: install tiktok-live-connector or deploy the updated package.json.';
-  warn(`${message}${context ? ` (${context})` : ''}`);
-  if (TIKTOK_CONNECTOR_LOAD_ERROR) warn(`TikTok dependency load error: ${TIKTOK_CONNECTOR_LOAD_ERROR}`);
-  try {
-    postAdminLog('error', 'tiktok', message, { context, error: TIKTOK_CONNECTOR_LOAD_ERROR }).catch(() => {});
-    postBotStatusToServer({ connected: botConnected || twitchConnected, connecting: false, error: message }).catch(() => {});
-  } catch (_) {}
-}
-
 function printBanner() {
   console.log(`
 ${C.cyan}${C.bold}╔══════════════════════════════════════════╗
@@ -252,7 +224,6 @@ ${C.cyan}${C.bold}╔═══════════════════�
   Auth  : ${ADMIN_PASSWORD ? `${C.green}✓ set${C.reset}` : `${C.red}✗ missing${C.reset}`}
   Cookie: ${SESSION_ID ? `${C.green}✓ primary set${C.reset}` : `${C.yellow}⚠ primary not set${C.reset}`} | Extra: ${SESSION_ID_2 || SESSION_IDS_BY_USER.size ? `${C.green}✓ set${C.reset}` : `${C.yellow}⚠ not set${C.reset}`}
   Users : ${C.yellow}${DATA_FILE}${C.reset}
-  TikTok: ${hasTikTokConnector() ? `${C.green}module loaded${C.reset}` : `${C.red}module missing${C.reset}`}
   Twitch: ${TWITCH_ENABLED ? C.green + 'ON ' + C.reset + TWITCH_CHANNELS.map(c => '#' + c).join(', ') : C.red + 'OFF' + C.reset}
   Sync  : ${C.green}Admin panel config sync ENABLED${C.reset}
 
@@ -1486,16 +1457,6 @@ function updateAggregateBotState() {
 }
 
 function createFreshTikTokConnection(entry) {
-  if (!hasTikTokConnector()) {
-    if (entry) {
-      entry.conn = null;
-      entry.connected = false;
-      entry.connecting = false;
-    }
-    warnMissingTikTokConnector(`creating connection for @${entry?.username || 'unknown'}`);
-    return null;
-  }
-
   // Important: tiktok-live-connector can get stuck after a failed/offline connect.
   // Make a brand-new connection object every time we retry, so one offline stream
   // never blocks the other stream and nobody has to redeploy when going live later.
@@ -1600,15 +1561,10 @@ function connectTikTok(username) {
   if (!getStreamUsers().includes(username)) return;
   const entry = ensureStream(username);
   if (!entry || entry.connecting || entry.connected) return;
-  if (!hasTikTokConnector()) {
-    warnMissingTikTokConnector(`connecting @${username}`);
-    return;
-  }
 
   entry.connecting = true;
   entry.lastConnectAttempt = Date.now();
   const currentConn = createFreshTikTokConnection(entry);
-  if (!currentConn) return;
 
   // If TikTok never answers while the live is offline/starting, do not stay stuck
   // in "connecting" forever. Reset this stream and keep scanning for the live.
@@ -1682,10 +1638,6 @@ function connectTikTok(username) {
 function connectAllTikTok() {
   rebuildTikTokConnections();
   const activeUsers = getStreamUsers();
-  if (activeUsers.length && !hasTikTokConnector()) {
-    warnMissingTikTokConnector('starting TikTok streams');
-    return;
-  }
   if (!activeUsers.length) {
     warn('No TikTok accounts are enabled. Turn one on in the admin panel to start watching chat.');
     postBotStatusToServer({ connected: false, connecting: false, error: 'No TikTok accounts enabled' });
@@ -1707,10 +1659,6 @@ function keepTikTokConnectionsAlive() {
   for (const username of activeUsers) {
     const entry = ensureStream(username);
     if (!entry) continue;
-    if (!hasTikTokConnector()) {
-      warnMissingTikTokConnector(`watchdog @${username}`);
-      continue;
-    }
 
     // If a connection attempt gets stuck, force it loose and retry.
     if (entry.connecting && entry.lastConnectAttempt && now - entry.lastConnectAttempt > CONNECT_TIMEOUT_MS + 10_000) {
