@@ -2,9 +2,9 @@
   "name": "siegequeue-livechat-logs",
   "version": "1.0.0",
   "description": "SiegeQueue website server and LiveQueue bot with live chat/log mirroring",
-  "main": "server.js",
+  "main": "index.js",
   "scripts": {
-    "start": "node server.js",
+    "start": "node index.js",
     "bot": "node index.js",
     "start:bot": "node index.js"
   },
