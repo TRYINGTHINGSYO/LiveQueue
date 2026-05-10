@@ -1501,6 +1501,14 @@ const TIKTOK_USER_AGENT = process.env.TIKTOK_USER_AGENT || 'Mozilla/5.0 (Windows
 
 function buildTikTokOptions(username) {
   const sessionId = getSessionIdForUsername(username);
+  // Newer tiktok-live-connector versions require tt-target-idc alongside sessionId.
+  // Read it from TIKTOK_TARGET_IDC env var (e.g. "useast2a"). If not set,
+  // we omit the session so the bot starts without crashing (anonymous mode).
+  const targetIdc = String(process.env.TIKTOK_TARGET_IDC || '').trim();
+  const useSession = Boolean(sessionId && targetIdc);
+  if (sessionId && !targetIdc) {
+    warn('TIKTOK_SESSION_ID is set but TIKTOK_TARGET_IDC is not — connecting without session (anonymous mode). Set TIKTOK_TARGET_IDC to enable authenticated mode.');
+  }
   return {
     enableExtendedGiftInfo  : false,
     enableWebsocketUpgrade  : true,
@@ -1516,7 +1524,7 @@ function buildTikTokOptions(username) {
     websocketOptions: {
       timeout: TIKTOK_WEBSOCKET_TIMEOUT_MS,
     },
-    ...(sessionId ? { sessionId } : {}),
+    ...(useSession ? { sessionId, ttTargetIdc: targetIdc } : {}),
   };
 }
 
@@ -1548,7 +1556,17 @@ function createFreshTikTokConnection(entry) {
     if (entry.conn) entry.conn.disconnect();
   } catch (_) {}
 
-  entry.conn = new WebcastPushConnection(entry.username, buildTikTokOptions(entry.username));
+  try {
+    entry.conn = new WebcastPushConnection(entry.username, buildTikTokOptions(entry.username));
+  } catch (connErr) {
+    const connErrMsg = connErr?.message || String(connErr);
+    err(`Failed to create TikTok connection for @${entry.username}: ${connErrMsg}`);
+    postAdminLog('error', 'tiktok', `Failed to create TikTok connection for @${entry.username}: ${connErrMsg}`).catch(() => {});
+    entry.conn = null;
+    entry.connecting = false;
+    entry.connected = false;
+    return null;
+  }
   registerTikTokEvents(entry);
   return entry.conn;
 }
