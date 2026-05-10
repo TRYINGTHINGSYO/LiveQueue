@@ -1,12 +1,15 @@
 {
-  "name": "r6-queue",
+  "name": "siegequeue-livechat-logs",
   "version": "1.0.0",
-  "description": "TikTok/Twitch SiegeQueue chat bot",
+  "description": "SiegeQueue website server and LiveQueue bot with live chat/log mirroring",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "bot": "node index.js",
+    "start:bot": "node index.js"
   },
   "dependencies": {
+    "express": "^4.18.3",
     "node-fetch": "^2.7.0",
     "tiktok-live-connector": "latest",
     "tmi.js": "^1.8.5"
