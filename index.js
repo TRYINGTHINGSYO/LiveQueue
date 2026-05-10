@@ -227,7 +227,7 @@ ${C.cyan}${C.bold}╔═══════════════════�
   Twitch: ${TWITCH_ENABLED ? C.green + 'ON ' + C.reset + TWITCH_CHANNELS.map(c => '#' + c).join(', ') : C.red + 'OFF' + C.reset}
   Sync  : ${C.green}Admin panel config sync ENABLED${C.reset}
 
-  ${C.dim}Commands: queue/q <UbisoftName> to save/join  •  queue/q to rejoin saved name  •  leave/l to leave queue  •  clear/c to clear saved name  •  ! versions also work  •  bare-name fallback OFF${C.reset}
+  ${C.dim}Commands: queue/q <UbisoftName> to save/join  •  queue/q to rejoin saved name  •  temp <UbisoftName> to join once without saving  •  leave/l to leave queue  •  clear/c/reset to clear saved name  •  ! versions also work  •  bare-name fallback OFF${C.reset}
 `);
 }
 
@@ -240,12 +240,17 @@ ${C.cyan}${C.bold}╔═══════════════════�
 //     queue UbisoftName, !queue UbisoftName, q UbisoftName, !q UbisoftName
 //     queue, !queue, q, !q
 //
+//   Temporary join without saving chat account -> Ubisoft name:
+//     temp UbisoftName, !temp UbisoftName
+//
 //   Leave the active queue but keep saved Ubisoft name:
 //     leave, !leave, l, !l
 //
 //   Clear saved Ubisoft name/history and remove from queue if active:
 //     clear, !clear, c, !c, reset, !reset, r, !r
 const JOIN_COMMAND_RE = /^(?:!?(?:queue|q))(?:\s+|$)/i;
+const TEMP_COMMAND_RE = /^(?:!?temp)(?:\s+|$)/i;
+const LEAVE_COMMAND_RE = /^!?(?:leave|l)$/i;
 const CLEAR_COMMAND_RE = /^!?(?:clear|c|reset|r)$/i;
 const RESET_COMMAND_RE = CLEAR_COMMAND_RE;
 
@@ -255,12 +260,17 @@ function parseBotCommandMessage(message) {
 
   const lower = text.toLowerCase();
 
-  if (/^!?(?:leave|l)$/.test(lower)) {
+  if (LEAVE_COMMAND_RE.test(lower)) {
     return { type: 'leave', arg: '', normalizedCommand: 'leave' };
   }
 
   if (CLEAR_COMMAND_RE.test(lower)) {
     return { type: 'reset', arg: '', normalizedCommand: 'clear' };
+  }
+
+  const tempMatch = text.match(/^!?temp(?:\s+(.+))?$/i);
+  if (tempMatch) {
+    return { type: 'temp', arg: String(tempMatch[1] || '').trim(), normalizedCommand: 'temp' };
   }
 
   const joinMatch = text.match(/^!?(?:queue|q)(?:\s+(.+))?$/i);
@@ -1035,12 +1045,14 @@ async function fetchBotConfigFromServer() {
     // but each Twitch account is stored with a twitch_ prefix so it never collides with TikTok.
     const beforeTwitchKey = JSON.stringify({ enabled: Boolean(TWITCH_ENABLED), channels: twitchChannelsKey(TWITCH_CHANNELS) });
     if (cfg.twitchEnabled !== undefined || cfg.twitchChannel !== undefined || cfg.twitchChannels !== undefined) {
-      TWITCH_ENABLED = cfgBool(cfg.twitchEnabled, TWITCH_ENABLED);
+      TWITCH_ENABLED = boolFromConfigOrEnv(cfg.twitchEnabled, TWITCH_ENABLED);
       const nextTwitchChannels = Array.isArray(cfg.twitchChannels)
         ? cfg.twitchChannels
         : String(cfg.twitchChannel || '').split(',');
-      if (nextTwitchChannels.length || cfg.twitchChannels !== undefined || cfg.twitchChannel !== undefined) {
-        TWITCH_CHANNELS = parseTwitchChannelList(nextTwitchChannels);
+      const parsedTwitchChannels = parseTwitchChannelList(nextTwitchChannels);
+      const configTouchedTwitchChannels = cfg.twitchChannels !== undefined || cfg.twitchChannel !== undefined;
+      if (parsedTwitchChannels.length || (configTouchedTwitchChannels && !TWITCH_ENV_FORCE_ENABLED)) {
+        TWITCH_CHANNELS = parsedTwitchChannels;
       }
     }
     TWITCH_CHANNELS = parseTwitchChannelList(TWITCH_CHANNELS);
@@ -1674,9 +1686,28 @@ function keepTikTokConnectionsAlive() {
 
 setInterval(keepTikTokConnectionsAlive, LIVE_SCAN_MS);
 
-// tiktok-live-connector is read-only; this logs what the bot would say.
+function twitchChannelFromSource(sourceUsername = '') {
+  const source = String(sourceUsername || '').trim();
+  const match = source.match(/^twitch:\s*#?([^,\s]+)/i);
+  return match ? cleanTwitchChannel(match[1]) : '';
+}
+
+function sendTwitchChatReply(sourceUsername = '', message = '') {
+  const channel = twitchChannelFromSource(sourceUsername);
+  const reply = String(message || '').trim().slice(0, 450);
+  if (!channel || !reply) return;
+  if (!TWITCH_BOT_USERNAME || !TWITCH_OAUTH_TOKEN) return;
+  if (!twitchClient || !twitchConnected || typeof twitchClient.say !== 'function') return;
+
+  twitchClient.say(`#${channel}`, reply).catch(e => {
+    warn(`Twitch reply failed in #${channel}: ${e?.message || e}`);
+  });
+}
+
+// TikTok is read-only; Twitch can reply when bot credentials are configured.
 function respond(tiktokId, message, sourceUsername = '') {
   log('CHAT ←', C.cyan, `${sourceUsername ? '[' + sourceUsername + '] ' : ''}@${tiktokId}: ${message}`);
+  sendTwitchChatReply(sourceUsername, message);
 }
 
 function safeTikTokErrorMessage(e) {
@@ -1757,7 +1788,7 @@ function registerTikTokEvents(entry) {
 
   // Some TikTok Live connector versions/accounts emit comments as `chat`;
   // others emit them as `comment`. Register BOTH for every stream so every
-  // enabled live can use queue/!queue <UbisoftName>. No other chat commands queue players.
+  // enabled live can use queue/!queue <UbisoftName> or temp/!temp <UbisoftName>.
   const handleChatCommand = async (data, eventName = 'chat', overrides = {}) => {
     const platform = String(overrides.platform || 'tiktok').toLowerCase();
     if (platform === 'tiktok' && entry.conn !== tiktok) return; // ignore late events from stale TikTok connection objects
@@ -1794,9 +1825,10 @@ function registerTikTokEvents(entry) {
     const isBareJoin = false;
     const parsedCommand = parseBotCommandMessage(msg);
     const isJoinCmd  = parsedCommand.type === 'join';
+    const isTempCmd  = parsedCommand.type === 'temp';
     const isResetCmd = parsedCommand.type === 'reset';
     const isLeaveCmd = parsedCommand.type === 'leave';
-    const isCmd = isJoinCmd || isResetCmd || isLeaveCmd;
+    const isCmd = isJoinCmd || isTempCmd || isResetCmd || isLeaveCmd;
     if (!isCmd) return;
 
     cmd(`[${sourceLabel}] queue command heard from @${display} / key=${userKey}: ${msg}`);
@@ -1818,9 +1850,9 @@ function registerTikTokEvents(entry) {
       return;
     }
 
-    // Only rate-limit queue JOIN and RESET commands (leave is always allowed).
+    // Only rate-limit queue/temp JOIN and RESET commands (leave is always allowed).
     const cooldownKey = `${userKey}:join`;
-    if (isJoinCmd && isOnCooldown(cooldownKey)) {
+    if ((isJoinCmd || isTempCmd) && isOnCooldown(cooldownKey)) {
       const left = Math.ceil(cooldownRemainingMs(cooldownKey) / 1000);
       cmd(`[${sourceLabel}] [cooldown] @${display} / key=${userKey} — ignored join (${left}s left, per-user cooldown)`);
       postAdminLog('warn', 'queue', `Cooldown ignored @${display}: wait ${left}s`, { stream: sourceLabel, tiktokId, userKey, cooldownKey, remainingSeconds: left });
@@ -1935,10 +1967,17 @@ function registerTikTokEvents(entry) {
       return;
     }
 
-    if (!isJoinCmd && !isBareJoin) return;
+    if (!isJoinCmd && !isTempCmd && !isBareJoin) return;
 
     const afterCommand = String(parsedCommand.arg || '').trim();
-    if (!afterCommand) {
+    if (isTempCmd && !afterCommand) {
+      respond(tiktokId, 'Use temp <YourUbisoftName> to join once without saving your chat name. Example: temp Blake', sourceLabel);
+      cmd(`[${sourceLabel}] [temp] @${display} missing Ubisoft name`);
+      postAdminLog('warn', 'queue', `Rejected temp from @${display}: missing Ubisoft name`, { stream: sourceLabel, tiktokId });
+      return;
+    }
+
+    if (!isTempCmd && !afterCommand) {
       // If they already saved a name, queue by itself should rejoin them.
       const savedRecord = getRecord(users, userKey);
       if (!savedRecord.name) {
@@ -1972,7 +2011,7 @@ function registerTikTokEvents(entry) {
       }
     }
 
-    if (ownNameIsActive(record)) {
+    if (!isTempCmd && ownNameIsActive(record)) {
       const pos = getPosition(record.name);
       // Determine if the person tried a DIFFERENT name or their same/saved name
       const triedName = isBareJoin ? bareJoinName : joinNameFromCommand;
@@ -2009,7 +2048,7 @@ function registerTikTokEvents(entry) {
       // Saved Ubisoft names stay permanent until the admin edits them.
       // If they already have a saved name, queue <different name> will NOT change the file.
       // They must ask admin to change the saved name first, then use queue <new name>.
-      if (record.name && record.name.toLowerCase() !== clean.toLowerCase()) {
+      if (!isTempCmd && record.name && record.name.toLowerCase() !== clean.toLowerCase()) {
         respond(tiktokId, `Your saved Ubisoft name is ${record.name}. Use queue with that exact name, or ask admin to change it first.`, sourceLabel);
         cmd(`[${sourceLabel}] [queue] @${display} tried to change ${record.name} → ${clean} without admin edit`);
         postAdminLog('warn', 'queue', `Rejected @${display}: tried to change saved name ${record.name} → ${clean}`, { stream: sourceLabel, tiktokId });
@@ -2029,7 +2068,7 @@ function registerTikTokEvents(entry) {
       // (e.g. TikTok has it, now Twitch is registering it — or vice versa),
       // adopt the existing canonical name spelling and continue normally.
       // This lets the same person type queue commands on both platforms.
-      if (!record.name) {
+      if (!isTempCmd && !record.name) {
         for (const [rawOwner, value] of Object.entries(users)) {
           const ownerKey = normalizeTikTokUsername(displayUserKey(rawOwner));
           if (!ownerKey || ownerKey === normalizeTikTokUsername(displayUserKey(userKey))) continue;
@@ -2051,17 +2090,23 @@ function registerTikTokEvents(entry) {
       const result = await addToQueue(clean);
       if (result === 'added' || result === 'already') {
         await refreshLiveQueueFromServer();
-        setRecord(users, userKey, { name: clean, queued: true });
-        const serverSaved = await saveSavedNameOnServer(overrides.saveKeys || (platform === 'twitch' ? [userKey] : [userKey, rawTikTokId]), clean);
-        cmd(`[${sourceLabel}] [queue] @${display} saved name after server accepted it: ${clean}${serverSaved ? ' (admin saved)' : ''}`);
+        let serverSaved = false;
+        if (!isTempCmd) {
+          setRecord(users, userKey, { name: clean, queued: true });
+          serverSaved = await saveSavedNameOnServer(overrides.saveKeys || (platform === 'twitch' ? [userKey] : [userKey, rawTikTokId]), clean);
+          cmd(`[${sourceLabel}] [queue] @${display} saved name after server accepted it: ${clean}${serverSaved ? ' (admin saved)' : ''}`);
+        } else {
+          cmd(`[${sourceLabel}] [temp] @${display} added without saving chat account: ${clean}`);
+          postBotStatusToServer().catch(() => {});
+        }
         const pos = getPosition(clean) || '?';
         respond(tiktokId, result === 'added' ? `${clean} added to queue! Position: #${pos}` : `${clean} is already in queue at #${pos}.`, sourceLabel);
-        ok(`[${sourceLabel}] [queue] @${display} → ${clean} ${result} (#${pos})`);
-        postAdminLog('success', 'queue', `${clean} ${result === 'added' ? 'added to queue' : 'already in queue'} from @${display}`, { stream: sourceLabel, tiktokId, userKey, name: clean, position: pos, result, serverSaved });
+        ok(`[${sourceLabel}] [${isTempCmd ? 'temp' : 'queue'}] @${display} → ${clean} ${result} (#${pos})`);
+        postAdminLog('success', 'queue', `${clean} ${result === 'added' ? 'added to queue' : 'already in queue'} from @${display}${isTempCmd ? ' (temp, not saved)' : ''}`, { stream: sourceLabel, tiktokId, userKey, name: clean, position: pos, result, serverSaved, temporary: isTempCmd });
       } else {
         // Important: do NOT save the TikTok → Ubisoft name if the website queue rejected it.
         // This stops random TikTok chat words/bad names from getting stuck on the account.
-        respond(tiktokId, `Could not add "${clean}" to the queue. Check the name and try: queue YourUbisoftName`, sourceLabel);
+        respond(tiktokId, `Could not add "${clean}" to the queue. Check the name and try: ${isTempCmd ? 'temp' : 'queue'} YourUbisoftName`, sourceLabel);
         err(`[${sourceLabel}] [queue] @${display} → server rejected ${clean}; not saving it`);
         postAdminLog('error', 'queue', `Server rejected ${clean} from @${display}`, { stream: sourceLabel, tiktokId, name: clean });
       }
@@ -2245,14 +2290,20 @@ function startTwitchChat() {
     }
 
     if (sharedQueueCommandHandler) {
-      await sharedQueueCommandHandler(data, 'twitch-message', {
-        platform: 'twitch',
-        sourceUsername: `twitch:#${channelName}`,
-        rawUserId: twitchUsername,
-        displayName,
-        userKey,
-        saveKeys: [userKey],
-      });
+      try {
+        await sharedQueueCommandHandler(data, 'twitch-message', {
+          platform: 'twitch',
+          sourceUsername: `twitch:#${channelName}`,
+          rawUserId: twitchUsername,
+          displayName,
+          userKey,
+          saveKeys: [userKey],
+        });
+      } catch (e) {
+        const messageText = e?.message || String(e || 'unknown Twitch command error');
+        err(`Twitch command handler failed for @${displayName}: ${messageText}`);
+        postAdminLog('error', 'twitch', `Twitch command handler failed for @${displayName}: ${messageText}`, { channel: channelName, twitchUsername });
+      }
     }
   });
 
