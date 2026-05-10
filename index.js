@@ -724,6 +724,24 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 8_000) {
   }
 }
 
+const POST_WARNING_THROTTLE_MS = 30_000;
+const lastPostWarningAt = new Map();
+
+function warnPostFailure(key, message) {
+  const now = Date.now();
+  const last = lastPostWarningAt.get(key) || 0;
+  if (now - last < POST_WARNING_THROTTLE_MS) return;
+  lastPostWarningAt.set(key, now);
+  warn(message);
+}
+
+async function responseFailureDetail(res) {
+  let body = '';
+  try { body = await res.text(); } catch (_) {}
+  body = String(body || '').replace(/\s+/g, ' ').trim().slice(0, 160);
+  return `${res.status} ${res.statusText || ''}${body ? ` - ${body}` : ''}`.trim();
+}
+
 async function fetchQueueState() {
   try {
     const r = await fetchWithTimeout(`${BASE_URL}/api/state`, {}, 8_000);
@@ -1163,18 +1181,38 @@ function mirrorChatMessage({ platform = 'tiktok', stream, tiktokId, twitchUserna
       event,
       ts: Date.now()
     }),
-  }, 4_000).catch(() => {});
+  }, 4_000).then(async (res) => {
+    if (res.ok) return;
+    const detail = await responseFailureDetail(res);
+    warnPostFailure('chat-mirror', `Live chat mirror failed at /api/bot/chat: ${detail}`);
+    postAdminLog('warn', 'chat-mirror', `Live chat mirror failed at /api/bot/chat: ${detail}`, {
+      endpoint: '/api/bot/chat',
+      status: res.status,
+      platform: cleanPlatform,
+      stream,
+    }).catch(() => {});
+  }).catch((e) => {
+    const message = e?.message || String(e || 'unknown error');
+    warnPostFailure('chat-mirror', `Live chat mirror could not reach ${BASE_URL}/api/bot/chat: ${message}`);
+  });
 }
 
 async function postAdminLog(type, category, message, meta = {}) {
   if (!ADMIN_PASSWORD) return;
   try {
-    await fetchWithTimeout(`${BASE_URL}/api/bot/log`, {
+    const res = await fetchWithTimeout(`${BASE_URL}/api/bot/log`, {
       method: 'POST',
       headers: authHeaders(),
       body: JSON.stringify({ type, category, message, meta }),
     }, 4_000);
-  } catch (_) { /* log posting is non-critical */ }
+    if (!res.ok) {
+      const detail = await responseFailureDetail(res);
+      warnPostFailure('bot-log', `Live bot log post failed at /api/bot/log: ${detail}`);
+    }
+  } catch (e) {
+    const errMsg = e?.message || String(e || 'unknown error');
+    warnPostFailure('bot-log', `Live bot log post could not reach ${BASE_URL}/api/bot/log: ${errMsg}`);
+  }
 }
 
 async function postBotStatusToServer(extra = {}) {
@@ -1185,7 +1223,7 @@ async function postBotStatusToServer(extra = {}) {
   const emptyRecords = Math.max(0, knownRecords - savedNameCount);
   const queuedRecords = savedUsers.filter(r => r?.queued || r?.active || r?.inQueue || r?.playing).length;
   try {
-    await fetchWithTimeout(`${BASE_URL}/api/bot/status`, {
+    const res = await fetchWithTimeout(`${BASE_URL}/api/bot/status`, {
       method: 'POST',
       headers: authHeaders(),
       body: JSON.stringify({
@@ -1226,7 +1264,14 @@ async function postBotStatusToServer(extra = {}) {
         },
       }),
     }, 5_000);
-  } catch (_) { /* non-critical */ }
+    if (!res.ok) {
+      const detail = await responseFailureDetail(res);
+      warnPostFailure('bot-status', `Bot status post failed at /api/bot/status: ${detail}`);
+    }
+  } catch (e) {
+    const errMsg = e?.message || String(e || 'unknown error');
+    warnPostFailure('bot-status', `Bot status post could not reach ${BASE_URL}/api/bot/status: ${errMsg}`);
+  }
 }
 
 // ── Live queue state (refreshed by poller) ─────────────────────────────────
