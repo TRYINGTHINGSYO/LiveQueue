@@ -1876,27 +1876,26 @@ function forceFreshTikTokReconnect(username, reason, delayMs = 8_000) {
 
 // ── Chat handler ────────────────────────────────────────────────────────────
 
-let sharedQueueCommandHandler = null;
+// ── Shared per-user deduplication maps (keyed by platform|stream|userId|msg) ──
+// Kept module-level so TikTok and Twitch share the same dedup window and a
+// Twitch command never races with a TikTok command for the same user.
+const globalRecentCommands = new Map();
 
-function registerTikTokEvents(entry) {
-  const tiktok = entry.conn;
-  const sourceUsername = entry.username;
-  const recentCommands = new Map();
-
-  // Some TikTok Live connector versions/accounts emit comments as `chat`;
-  // others emit them as `comment`. Register BOTH for every stream so every
-  // enabled live can use queue/!queue <UbisoftName> or temp/!temp <UbisoftName>.
-  const handleChatCommand = async (data, eventName = 'chat', overrides = {}) => {
+// ── Core queue command handler — called by BOTH TikTok and Twitch ──────────
+// `entry` is the TikTok stream entry (for markTikTokEvent / lastChatAt) or null
+// when called from Twitch with no TikTok session active.
+async function handleChatCommand(data, eventName = 'chat', overrides = {}, entry = null) {
     const platform = String(overrides.platform || 'tiktok').toLowerCase();
-    if (platform === 'tiktok' && entry.conn !== tiktok) return; // ignore late events from stale TikTok connection objects
-    const sourceLabel = String(overrides.sourceUsername || sourceUsername || platform).trim();
+    // For TikTok: ignore late callbacks from stale connection objects.
+    if (platform === 'tiktok' && entry && overrides._tiktokConn && entry.conn !== overrides._tiktokConn) return;
+    const sourceLabel = String(overrides.sourceUsername || (entry ? entry.username : '') || platform).trim();
     const display  = overrides.displayName || data?.nickname || data?.user?.nickname || data?.uniqueId || data?.user?.uniqueId || 'unknown';
     const rawTikTokId = overrides.rawUserId || safeTikTokIdentity(data, display, sourceLabel);
     const tiktokId = rawTikTokId;
     const userKey = overrides.userKey || (platform === 'twitch' ? platformUserKey('twitch', rawTikTokId) : streamUserKey(sourceLabel, rawTikTokId));
     const msg      = String(data?.comment || data?.text || data?.content || data?.msg || '').trim();
     const lower    = msg.toLowerCase();
-    if (platform === 'tiktok') {
+    if (platform === 'tiktok' && entry) {
       markTikTokEvent(entry);
       entry.lastChatAt = Date.now();
     }
@@ -1932,14 +1931,14 @@ function registerTikTokEvents(entry) {
     postAdminLog('info', 'queue', `@${display} typed ${msg}`, { stream: sourceLabel, platform, tiktokId });
 
     // Prevent duplicate handling if a connector emits both `chat` and `comment`
-    // for the same message. Keeps one person from being queued twice.
+    // for the same message. Also deduplicates across TikTok and Twitch for the same user.
     const now = Date.now();
-    for (const [key, t] of recentCommands) {
-      if (now - t > 2500) recentCommands.delete(key);
+    for (const [key, t] of globalRecentCommands) {
+      if (now - t > 2500) globalRecentCommands.delete(key);
     }
     const dedupeKey = `${platform}|${sourceLabel}|${rawTikTokId}|${lower}`;
-    if (recentCommands.has(dedupeKey)) return;
-    recentCommands.set(dedupeKey, now);
+    if (globalRecentCommands.has(dedupeKey)) return;
+    globalRecentCommands.set(dedupeKey, now);
 
     if (BANNED_TIKTOK_USERS.has(tiktokId)) {
       cmd(`[${sourceLabel}] [blocked] @${display} tried command: ${msg}`);
@@ -2212,12 +2211,19 @@ function registerTikTokEvents(entry) {
 
     respond(tiktokId, 'Use queue <YourUbisoftName> to save your name before using queue by itself.', sourceLabel);
     cmd(`[${sourceLabel}] [queue] @${display} — no saved name`);
-  };
+}
 
-  sharedQueueCommandHandler = (data, eventName = 'chat', overrides = {}) => handleChatCommand(data, eventName, overrides);
+// ── TikTok event registration — wires TikTok-specific events; chat is routed
+// to the shared handleChatCommand above so Twitch uses the exact same logic. ──
 
-  tiktok.on('chat', data => handleChatCommand(data, 'chat'));
-  tiktok.on('comment', data => handleChatCommand(data, 'comment'));
+function registerTikTokEvents(entry) {
+  const tiktok = entry.conn;
+  const sourceUsername = entry.username;
+
+  // Route TikTok chat/comment events to the shared handler.
+  // Pass _tiktokConn so the handler can detect stale connection objects.
+  tiktok.on('chat',    data => handleChatCommand(data, 'chat',    { _tiktokConn: tiktok }, entry));
+  tiktok.on('comment', data => handleChatCommand(data, 'comment', { _tiktokConn: tiktok }, entry));
 
   // Mark any TikTok activity so the stale-connection watchdog does not fire
   // during active lives that happen to have a gap in chat/roomUser events.
@@ -2370,37 +2376,20 @@ function startTwitchChat() {
       user: { uniqueId: twitchUsername, nickname: displayName },
     };
 
-    // If TikTok is disabled and no TikTok stream has built the shared handler yet,
-    // create one lightweight fake TikTok entry only to reuse the exact same queue logic.
-    if (!sharedQueueCommandHandler) {
-      const fakeEntry = {
-        username: 'twitch',
-        conn: { on() {}, disconnect() {} },
-        connected: false,
-        connecting: false,
-        currentViewers: 0,
-        currentRoomId: null,
-        lastChatAt: 0,
-        lastAnyEventAt: 0,
-      };
-      registerTikTokEvents(fakeEntry);
-    }
-
-    if (sharedQueueCommandHandler) {
-      try {
-        await sharedQueueCommandHandler(data, 'twitch-message', {
-          platform: 'twitch',
-          sourceUsername: `twitch:#${channelName}`,
-          rawUserId: twitchUsername,
-          displayName,
-          userKey,
-          saveKeys: [userKey],
-        });
-      } catch (e) {
-        const messageText = e?.message || String(e || 'unknown Twitch command error');
-        err(`Twitch command handler failed for @${displayName}: ${messageText}`);
-        postAdminLog('error', 'twitch', `Twitch command handler failed for @${displayName}: ${messageText}`, { channel: channelName, twitchUsername });
-      }
+    // Call the shared handler directly — no fakeEntry or sharedQueueCommandHandler needed.
+    try {
+      await handleChatCommand(data, 'twitch-message', {
+        platform: 'twitch',
+        sourceUsername: `twitch:#${channelName}`,
+        rawUserId: twitchUsername,
+        displayName,
+        userKey,
+        saveKeys: [userKey],
+      }, null);
+    } catch (e) {
+      const messageText = e?.message || String(e || 'unknown Twitch command error');
+      err(`Twitch command handler failed for @${displayName}: ${messageText}`);
+      postAdminLog('error', 'twitch', `Twitch command handler failed for @${displayName}: ${messageText}`, { channel: channelName, twitchUsername });
     }
   });
 
