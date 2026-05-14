@@ -62,6 +62,10 @@ function getStreamUsers() {
   const list = [];
   if (TIKTOK_USERNAME_ENABLED) list.push(TIKTOK_USERNAME);
   if (TIKTOK_USERNAME_2_ENABLED) list.push(...EXTRA_TIKTOK_USERNAMES);
+  // NEW: include all streamers who configured a TikTok username + session ID via dashboard
+  for (const [username] of tiktokUsernameToSlug) {
+    if (username && serverProvidedSessions.has(username)) list.push(username);
+  }
   return uniqueTikTokUsers(list);
 }
 
