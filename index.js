@@ -116,6 +116,8 @@ const SESSION_IDS_BY_USER = parseSessionIdMap(process.env.TIKTOK_SESSION_IDS || 
 
 function getSessionIdForUsername(username) {
   const user = normalizeTikTokUsername(username);
+  // Server-provided session (from streamer's dashboard) takes priority over env vars.
+  if (serverProvidedSessions.has(user)) return serverProvidedSessions.get(user);
   if (SESSION_IDS_BY_USER.has(user)) return SESSION_IDS_BY_USER.get(user);
   if (user && user === normalizeTikTokUsername(TIKTOK_USERNAME)) return SESSION_ID;
 
@@ -125,6 +127,11 @@ function getSessionIdForUsername(username) {
   // Fallback: one sessionid can often read multiple public lives.
   return SESSION_ID;
 }
+
+// Per-streamer slug routing — populated by fetchBotStreamersFromServer().
+const tiktokUsernameToSlug   = new Map(); // tiktokUsername → slug
+const twitchChannelToSlug    = new Map(); // twitchChannel  → slug
+const serverProvidedSessions = new Map(); // tiktokUsername → sessionId (decrypted)
 
 // These are mutable — overwritten when server config is fetched.
 let POLL_MS        = Number(process.env.POLL_MS      || 5_000);
@@ -696,16 +703,18 @@ function bodyLooksAlready(text) {
   return t.includes('already in queue') || t.includes('in the queue') || t.includes('already playing') || t.includes('currently playing');
 }
 
-async function addToQueue(name) {
+async function addToQueue(name, slug) {
   const valid = validateName(name);
   if (!valid.ok) return 'error';
   const clean = valid.name;
   if (!ADMIN_PASSWORD) { err('ADMIN_PASSWORD not set — cannot add to queue'); return 'error'; }
 
-  const attempts = [
-    { url: `${BASE_URL}/api/admin/add-to-queue`, body: { name: clean } },
-    { url: `${BASE_URL}/api/admin/add`,          body: { name: clean } },
-  ];
+  const attempts = slug
+    ? [{ url: `${BASE_URL}/api/s/${encodeURIComponent(slug)}/admin/add`, body: { name: clean } }]
+    : [
+        { url: `${BASE_URL}/api/admin/add-to-queue`, body: { name: clean } },
+        { url: `${BASE_URL}/api/admin/add`,          body: { name: clean } },
+      ];
 
   for (const attempt of attempts) {
     try {
@@ -758,7 +767,7 @@ async function postPositionSpotlight(name, tiktokId = '') {
   }
 }
 
-async function removeFromQueue(name) {
+async function removeFromQueue(name, slug) {
   const clean = String(name || '').trim();
   if (!clean) return 'not_found';
   if (!ADMIN_PASSWORD) { err('ADMIN_PASSWORD not set — cannot remove from queue'); return 'error'; }
@@ -767,14 +776,22 @@ async function removeFromQueue(name) {
   const queuedPlayer = findQueuedPlayerByName(clean);
   if (!queuedPlayer) return 'not_found';
 
-  const attempts = [];
-  if (queuedPlayer.id) {
-    attempts.push({ url: `${BASE_URL}/api/admin/kick`, body: { id: queuedPlayer.id } });
-    attempts.push({ url: `${BASE_URL}/api/admin/remove`, body: { id: queuedPlayer.id } });
+  let attempts;
+  if (slug) {
+    const base = `${BASE_URL}/api/s/${encodeURIComponent(slug)}/admin/kick`;
+    attempts = [];
+    if (queuedPlayer.id) attempts.push({ url: base, body: { id: queuedPlayer.id } });
+    attempts.push({ url: base, body: { name: clean } });
+  } else {
+    attempts = [];
+    if (queuedPlayer.id) {
+      attempts.push({ url: `${BASE_URL}/api/admin/kick`, body: { id: queuedPlayer.id } });
+      attempts.push({ url: `${BASE_URL}/api/admin/remove`, body: { id: queuedPlayer.id } });
+    }
+    attempts.push({ url: `${BASE_URL}/api/admin/kick`, body: { name: clean } });
+    attempts.push({ url: `${BASE_URL}/api/admin/remove`, body: { name: clean } });
+    attempts.push({ url: `${BASE_URL}/api/admin/remove-from-queue`, body: { name: clean } });
   }
-  attempts.push({ url: `${BASE_URL}/api/admin/kick`, body: { name: clean } });
-  attempts.push({ url: `${BASE_URL}/api/admin/remove`, body: { name: clean } });
-  attempts.push({ url: `${BASE_URL}/api/admin/remove-from-queue`, body: { name: clean } });
 
   for (const attempt of attempts) {
     try {
@@ -1051,6 +1068,68 @@ async function fetchBotConfigFromServer() {
     }
   } catch (e) {
     if (!e.message?.includes('aborted')) warn(`[sync] Config fetch error: ${e.message}`);
+  }
+}
+
+/**
+ * Fetch per-streamer TikTok/Twitch configs from the server.
+ * Populates slug routing maps and server-provided session IDs.
+ * Called at startup and every 60s so dashboard changes propagate automatically.
+ */
+async function fetchBotStreamersFromServer() {
+  if (!ADMIN_PASSWORD) return;
+  try {
+    const r = await fetchWithTimeout(`${BASE_URL}/api/bot/streamers`, { headers: authHeaders() }, 8_000);
+    if (!r.ok) {
+      if (r.status !== 404) warn(`[sync] /api/bot/streamers returned ${r.status} — skipping`);
+      return;
+    }
+    const { streamers } = await r.json();
+    if (!Array.isArray(streamers)) return;
+
+    tiktokUsernameToSlug.clear();
+    twitchChannelToSlug.clear();
+    serverProvidedSessions.clear();
+
+    const newTwitchChannels = [];
+    for (const s of streamers) {
+      const slug = String(s.slug || '').trim();
+      if (!slug) continue;
+      if (s.tiktokUsername) {
+        const u = normalizeTikTokUsername(s.tiktokUsername);
+        if (u) {
+          tiktokUsernameToSlug.set(u, slug);
+          if (s.tiktokSessionId) serverProvidedSessions.set(u, s.tiktokSessionId);
+        }
+      }
+      if (s.twitchChannel) {
+        const ch = String(s.twitchChannel).toLowerCase().replace(/^#+/, '');
+        if (ch) {
+          twitchChannelToSlug.set(ch, slug);
+          newTwitchChannels.push(ch);
+        }
+      }
+    }
+
+    info(`[sync] Loaded ${tiktokUsernameToSlug.size} TikTok / ${twitchChannelToSlug.size} Twitch streamer configs from server`);
+
+    // Rebuild TikTok connections so new sessions and usernames are picked up.
+    rebuildTikTokConnections();
+    connectAllTikTok();
+
+    // Merge server-provided Twitch channels with any from env vars, restart if changed.
+    const envChannels = parseTwitchChannelList(process.env.TWITCH_CHANNELS || process.env.TWITCH_CHANNEL || '');
+    const merged = parseTwitchChannelList([...new Set([...envChannels, ...newTwitchChannels])].join(','));
+    const beforeKey = JSON.stringify(twitchChannelsKey(TWITCH_CHANNELS));
+    TWITCH_CHANNELS = merged;
+    if (merged.length > 0) TWITCH_ENABLED = true;
+    const afterKey = JSON.stringify(twitchChannelsKey(TWITCH_CHANNELS));
+    if (afterKey !== beforeKey) {
+      info(`[sync] Twitch channels updated: ${twitchChannelsDisplay() || 'none'}`);
+      restartTwitchChat();
+    }
+  } catch (e) {
+    if (!e.message?.includes('aborted')) warn(`[sync] fetchBotStreamersFromServer error: ${e.message}`);
   }
 }
 
@@ -1519,6 +1598,7 @@ function ensureStream(username) {
 
   const entry = {
     username,
+    slug: tiktokUsernameToSlug.get(username) || null,
     conn: null,
     retryDelay: 10_000,
     reconnectTimer: null,
@@ -1569,7 +1649,9 @@ function canRebuildTikTokNow(sourceUsername) {
 function rebuildTikTokConnections() {
   const wanted = new Set(getStreamUsers());
 
-  for (const username of [...streams.keys()]) {
+  for (const [username, entry] of streams) {
+    // Refresh slug on each rebuild so dashboard changes propagate without restart.
+    entry.slug = tiktokUsernameToSlug.get(username) || entry.slug || null;
     if (!wanted.has(username)) {
       warn(`[sync] Removing TikTok connection @${username}`);
       disconnectStream(username);
@@ -1847,6 +1929,15 @@ async function handleChatCommand(data, eventName = 'chat', overrides = {}, entry
     const platform = String(overrides.platform || 'tiktok').toLowerCase();
     // For TikTok: ignore late callbacks from stale connection objects.
     if (platform === 'tiktok' && entry && overrides._tiktokConn && entry.conn !== overrides._tiktokConn) return;
+
+    // Resolve the streamer slug for per-streamer queue routing.
+    let streamSlug = null;
+    if (platform === 'tiktok' && entry && entry.slug) {
+      streamSlug = entry.slug;
+    } else if (platform === 'twitch') {
+      const ch = String(overrides.sourceUsername || '').replace(/^twitch:#/, '');
+      streamSlug = twitchChannelToSlug.get(ch) || null;
+    }
     const sourceLabel = String(overrides.sourceUsername || (entry ? entry.username : '') || platform).trim();
     const display  = overrides.displayName || data?.nickname || data?.user?.nickname || data?.uniqueId || data?.user?.uniqueId || 'unknown';
     const rawTikTokId = overrides.rawUserId || safeTikTokIdentity(data, display, sourceLabel);
@@ -1955,7 +2046,7 @@ async function handleChatCommand(data, eventName = 'chat', overrides = {}, entry
 
       await refreshLiveQueueFromServer();
       if (isInQueue(oldName) || isPlaying(oldName)) {
-        await removeFromQueue(oldName);
+        await removeFromQueue(oldName, streamSlug);
         await refreshLiveQueueFromServer();
       }
 
@@ -2000,7 +2091,7 @@ async function handleChatCommand(data, eventName = 'chat', overrides = {}, entry
         postAdminLog('warn', 'queue', `@${display} used leave but is not in queue`, { stream: sourceLabel, tiktokId });
         return;
       }
-      const leaveResult = await removeFromQueue(nameToRemove);
+      const leaveResult = await removeFromQueue(nameToRemove, streamSlug);
       if (leaveResult === 'removed') {
         users[userKey] = { name: nameToRemove, queued: false };
         saveUsers(users);
@@ -2142,7 +2233,7 @@ async function handleChatCommand(data, eventName = 'chat', overrides = {}, entry
           }
         }
       }
-      const result = await addToQueue(clean);
+      const result = await addToQueue(clean, streamSlug);
       if (result === 'added' || result === 'already') {
         await refreshLiveQueueFromServer();
         let serverSaved = false;
@@ -2394,6 +2485,7 @@ setInterval(() => postBotStatusToServer(), 30_000);
 // A username change triggers a full reconnect.
 
 setInterval(fetchBotConfigFromServer, 60_000);
+setInterval(fetchBotStreamersFromServer, 60_000);
 // Apply admin name edits quickly so saved names are written into users.json soon after you finish editing.
 setInterval(applyAdminSavedNameOverrides, 5_000);
 
@@ -2412,6 +2504,7 @@ printBanner();
 
 // Fetch server config FIRST so we use the admin-set username, cooldown, etc.
 fetchBotConfigFromServer()
+  .then(() => fetchBotStreamersFromServer())
   .then(() => {
     ok('[sync] Config loaded from server — starting TikTok connection');
     connectAllTikTok();
