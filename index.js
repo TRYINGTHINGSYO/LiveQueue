@@ -1113,9 +1113,28 @@ async function fetchBotStreamersFromServer() {
           newTwitchChannels.push(ch);
         }
       }
+      // Co-stream relays (SiegeQueue dashboard): guest TikTok / Twitch → same slug + queue
+      const relays = Array.isArray(s.relayConnections) ? s.relayConnections : [];
+      for (const rel of relays) {
+        if (!rel || typeof rel !== 'object') continue;
+        if (rel.tiktokEnabled !== false && rel.tiktokUsername) {
+          const u = normalizeTikTokUsername(rel.tiktokUsername);
+          if (u) {
+            tiktokUsernameToSlug.set(u, slug);
+            if (rel.tiktokSessionId) serverProvidedSessions.set(u, rel.tiktokSessionId);
+          }
+        }
+        if (rel.twitchEnabled !== false && rel.twitchChannel) {
+          const ch = String(rel.twitchChannel).toLowerCase().replace(/^#+/, '');
+          if (ch) {
+            twitchChannelToSlug.set(ch, slug);
+            newTwitchChannels.push(ch);
+          }
+        }
+      }
     }
 
-    info(`[sync] Loaded ${tiktokUsernameToSlug.size} TikTok / ${twitchChannelToSlug.size} Twitch streamer configs from server`);
+    info(`[sync] Loaded ${tiktokUsernameToSlug.size} TikTok / ${twitchChannelToSlug.size} Twitch streamer configs from server (includes co-stream relays)`);
 
     // Rebuild TikTok connections so new sessions and usernames are picked up.
     rebuildTikTokConnections();
