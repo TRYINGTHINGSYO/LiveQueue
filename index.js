@@ -26,6 +26,11 @@ const {
   parseTwitchChannelList,
   uniqueTikTokUsers,
 } = require('./livequeue-utils');
+const { createStreamerRegistry, tiktokKey } = require('./streamer-registry');
+const { createReconnectPolicy } = require('./reconnect-policy');
+
+/** Legacy single-creator env mode (fsblaker/barbariandino). Off by default in production. */
+const LEGACY_BOT_MODE = envBool(process.env.LEGACY_BOT_MODE || process.env.BOT_LEGACY_MODE, false);
 
 // TikTok chat support. Keep this optional so a stale Railway build without the
 // dependency does not crash before Twitch/status logging can start.
@@ -58,23 +63,49 @@ try {
 // Env-vars are the baseline defaults.
 // fetchBotConfigFromServer() overwrites these at startup and every ~60 s.
 
+const streamerRegistry = createStreamerRegistry();
+const tiktokUsernameToSlug = streamerRegistry.maps.tiktokUsernameToSlug;
+const twitchChannelToSlug = streamerRegistry.maps.twitchChannelToSlug;
+const serverProvidedSessions = streamerRegistry.maps.serverProvidedSessions;
+
 function getStreamUsers() {
+  const fromPlatform = streamerRegistry.getTikTokUsernames();
+  if (!LEGACY_BOT_MODE) return uniqueTikTokUsers(fromPlatform);
+
   const list = [];
-  if (TIKTOK_USERNAME_ENABLED) list.push(TIKTOK_USERNAME);
+  if (TIKTOK_USERNAME_ENABLED && TIKTOK_USERNAME) list.push(TIKTOK_USERNAME);
   if (TIKTOK_USERNAME_2_ENABLED) list.push(...EXTRA_TIKTOK_USERNAMES);
-  // NEW: include all streamers who configured a TikTok username + session ID via dashboard
-  for (const [username] of tiktokUsernameToSlug) {
-    if (username && serverProvidedSessions.has(username)) list.push(username);
+  for (const u of fromPlatform) {
+    if (!list.includes(u)) list.push(u);
   }
   return uniqueTikTokUsers(list);
 }
 
-let TIKTOK_USERNAME = normalizeTikTokUsername(process.env.TIKTOK_USERNAME || 'fsblaker');
-let TIKTOK_USERNAME_ENABLED = envBool(process.env.TIKTOK_USERNAME_ENABLED, Boolean(TIKTOK_USERNAME));
+function getTwitchChannelsForWorker() {
+  const fromPlatform = streamerRegistry.getTwitchChannels();
+  if (!LEGACY_BOT_MODE) return parseTwitchChannelList(fromPlatform);
+
+  const envChannels = parseTwitchChannelList(process.env.TWITCH_CHANNELS || process.env.TWITCH_CHANNEL || '');
+  return parseTwitchChannelList([...new Set([...envChannels, ...fromPlatform])].join(','));
+}
+
+function syncTwitchChannelsFromRegistry() {
+  const next = getTwitchChannelsForWorker();
+  const changed = twitchChannelsKey(next) !== twitchChannelsKey(TWITCH_CHANNELS);
+  TWITCH_CHANNELS = next;
+  TWITCH_ENABLED = TWITCH_ENV_FORCE_ENABLED || next.length > 0;
+  return changed;
+}
+
+let TIKTOK_USERNAME = normalizeTikTokUsername(process.env.TIKTOK_USERNAME || '');
+let TIKTOK_USERNAME_ENABLED = envBool(process.env.TIKTOK_USERNAME_ENABLED, LEGACY_BOT_MODE && Boolean(TIKTOK_USERNAME));
 let EXTRA_TIKTOK_USERNAMES = parseTikTokUserList(
-  process.env.EXTRA_TIKTOK_USERNAMES || process.env.TIKTOK_USERNAME_2 || 'barbariandino'
+  process.env.EXTRA_TIKTOK_USERNAMES || process.env.TIKTOK_USERNAME_2 || ''
 );
-let TIKTOK_USERNAME_2_ENABLED = envBool(process.env.TIKTOK_USERNAME_2_ENABLED, EXTRA_TIKTOK_USERNAMES.length > 0);
+let TIKTOK_USERNAME_2_ENABLED = envBool(
+  process.env.TIKTOK_USERNAME_2_ENABLED,
+  LEGACY_BOT_MODE && EXTRA_TIKTOK_USERNAMES.length > 0
+);
 function twitchChannelsKey(channels = TWITCH_CHANNELS) {
   return JSON.stringify(parseTwitchChannelList(channels).sort());
 }
@@ -132,17 +163,18 @@ function getSessionIdForUsername(username) {
   return SESSION_ID;
 }
 
-// Per-streamer slug routing — populated by fetchBotStreamersFromServer().
-const tiktokUsernameToSlug   = new Map(); // tiktokUsername → slug
-const twitchChannelToSlug    = new Map(); // twitchChannel  → slug
-const serverProvidedSessions = new Map(); // tiktokUsername → sessionId (decrypted)
-
 // These are mutable — overwritten when server config is fetched.
 let POLL_MS        = Number(process.env.POLL_MS      || 5_000);
 let COOLDOWN_MS    = Number(process.env.COOLDOWN_MS  || 8_000);
-let MAX_RETRY_MS   = Number(process.env.MAX_RETRY_MS || 30_000);
+let MAX_RETRY_MS   = Number(process.env.MAX_RETRY_MS || 300_000);
+const MIN_RETRY_MS = Number(process.env.MIN_RETRY_MS || 30_000);
 const CONNECT_TIMEOUT_MS = Number(process.env.CONNECT_TIMEOUT_MS || 20_000);
-const LIVE_SCAN_MS       = Number(process.env.LIVE_SCAN_MS || 5_000);
+const LIVE_SCAN_MS       = Number(process.env.LIVE_SCAN_MS || 15_000);
+const tiktokReconnect = createReconnectPolicy({
+  minDelayMs: MIN_RETRY_MS,
+  maxDelayMs: MAX_RETRY_MS,
+});
+const lastConnectLogAt = new Map();
 // If TikTok says it is connected but stops sending room/chat events, rebuild the connection.
 // This fixes the common post-restart-live stale cursor issue.
 // NOTE: 20s was too aggressive — busy lives can have natural 20-30s gaps between roomUser/chat
@@ -221,23 +253,48 @@ function warnMissingTikTokConnector(context = '') {
 }
 
 function printBanner() {
+  const tiktokTargets = streamerRegistry.listTikTokTargets();
+  const twitchTargets = streamerRegistry.listTargets().filter(t => t.platform === 'twitch');
+  const tiktokPreview = tiktokTargets.slice(0, 6).map(t => `@${t.username}${t.slug ? `→${t.slug}` : ''}`).join(', ');
+  const twitchPreview = twitchTargets.slice(0, 6).map(t => `#${t.channel}${t.slug ? `→${t.slug}` : ''}`).join(', ');
   console.log(`
 ${C.cyan}${C.bold}╔══════════════════════════════════════════╗
-║     TikTok/Twitch Queue Bot • siegequeue  ║
+║   LiveQueue Worker • multi-streamer mode  ║
 ╚══════════════════════════════════════════╝${C.reset}
-  Users : ${C.yellow}${getStreamUsers().length ? getStreamUsers().map(u => '@' + u).join(' + ') : 'none enabled'}${C.reset}
-  Main  : ${TIKTOK_USERNAME_ENABLED ? C.green + 'ON ' + C.reset : C.red + 'OFF' + C.reset} @${TIKTOK_USERNAME || 'not set'}
-  Extra : ${TIKTOK_USERNAME_2_ENABLED ? C.green + 'ON ' + C.reset : C.red + 'OFF' + C.reset} ${EXTRA_TIKTOK_USERNAMES.map(u => '@' + u).join(', ') || 'none'}
+  Mode  : ${LEGACY_BOT_MODE ? C.yellow + 'legacy env + platform' + C.reset : C.green + 'platform-driven' + C.reset}
+  TikTok: ${C.yellow}${tiktokTargets.length}${C.reset} armed ${tiktokPreview ? `(${tiktokPreview}${tiktokTargets.length > 6 ? ', …' : ''})` : ''}
+  Twitch: ${C.yellow}${twitchTargets.length}${C.reset} armed ${twitchPreview ? `(${twitchPreview}${twitchTargets.length > 6 ? ', …' : ''})` : ''}
   API   : ${C.yellow}${BASE_URL}${C.reset}
-  Auth  : ${ADMIN_PASSWORD ? `${C.green}✓ set${C.reset}` : `${C.red}✗ missing${C.reset}`}
-  Cookie: ${SESSION_ID ? `${C.green}✓ primary set${C.reset}` : `${C.yellow}⚠ primary not set${C.reset}`} | Extra: ${SESSION_ID_2 || SESSION_IDS_BY_USER.size ? `${C.green}✓ set${C.reset}` : `${C.yellow}⚠ not set${C.reset}`}
-  Users : ${C.yellow}${DATA_FILE}${C.reset}
+  Auth  : ${ADMIN_PASSWORD ? `${C.green}✓ set${C.reset}` : `${C.red}✗ missing (required)${C.reset}`}
+  Retry : ${C.dim}${Math.round(MIN_RETRY_MS / 1000)}s – ${Math.round(MAX_RETRY_MS / 1000)}s exponential backoff${C.reset}
+  Data  : ${C.yellow}${DATA_FILE}${C.reset}
   TikTok: ${hasTikTokConnector() ? `${C.green}module loaded${C.reset}` : `${C.red}module missing${C.reset}`}
-  Twitch: ${TWITCH_ENABLED ? C.green + 'ON ' + C.reset + TWITCH_CHANNELS.map(c => '#' + c).join(', ') : C.red + 'OFF' + C.reset}
-  Sync  : ${C.green}Admin panel config sync ENABLED${C.reset}
+  Twitch: ${TWITCH_ENABLED ? C.green + 'ON ' + C.reset + (twitchChannelsDisplay() || 'no channels') : C.red + 'OFF' + C.reset}
 
-  ${C.dim}Commands: queue/q <UbisoftName> to save/join  |  queue/q to rejoin saved name  |  temp <UbisoftName> to join once without saving  |  leave to leave queue  |  reset clears saved name  |  bare-name fallback OFF${C.reset}
+  ${C.dim}Commands route to each streamer's queue via slug. Offline lives stay armed with backoff (not fatal).${C.reset}
 `);
+}
+
+function classifyTikTokConnectFailure(message) {
+  const m = String(message || '').toLowerCase();
+  if (/user.*not.*found|invalid.*user|username.*invalid|doesn't exist|does not exist|not found|unknown user|live has ended|not live|room.*not|no live/i.test(m)) {
+    return { invalid: true };
+  }
+  if (/rate.?limit|too many requests|429|retryafter|throttl/i.test(m)) {
+    return { rateLimited: true };
+  }
+  return {};
+}
+
+function logConnectThrottled(username, level, ...args) {
+  const key = `${level}:${normalizeTikTokUsername(username)}`;
+  const now = Date.now();
+  const throttleMs = level === 'err' ? 120_000 : 90_000;
+  if (now - (lastConnectLogAt.get(key) || 0) < throttleMs) return;
+  lastConnectLogAt.set(key, now);
+  if (level === 'err') err(...args);
+  else if (level === 'warn') warn(...args);
+  else info(...args);
 }
 
 
@@ -503,11 +560,11 @@ function setRecord(users, userKey, record) {
   }, 0);
 }
 
-// Saved-name/lock key is GLOBAL per TikTok account, not per stream.
-// This means @somebody has ONE Ubisoft name across @fsblaker and @barbariandino.
-// They cannot use one Ubisoft name in your queue and a different one in hers.
-function streamUserKey(sourceUsername, tiktokId) {
-  return normalizeTikTokUsername(tiktokId || 'unknown');
+/** Per-streamer saved-name scope when slug is known; otherwise legacy global key. */
+function streamUserKey(sourceUsername, tiktokId, streamSlug = null) {
+  const base = normalizeTikTokUsername(tiktokId || 'unknown');
+  const slug = String(streamSlug || '').trim();
+  return slug ? `${slug}::${base}` : base;
 }
 
 function platformUserKey(platform, username) {
@@ -1017,58 +1074,54 @@ async function fetchBotConfigFromServer() {
       }
     }
 
-    // TikTok usernames + enabled toggles from the admin panel.
-    // The admin can turn either live chat on/off without admin editemoving the saved usernames.
-    const beforeUsersKey = JSON.stringify(getStreamUsers());
+    // Legacy global bot-config usernames only apply in LEGACY_BOT_MODE.
+    if (LEGACY_BOT_MODE) {
+      const beforeUsersKey = JSON.stringify(getStreamUsers());
 
-    if (typeof cfg.username === 'string') {
-      const nextPrimary = normalizeTikTokUsername(cfg.username);
-      if (nextPrimary) TIKTOK_USERNAME = nextPrimary;
-    }
-
-    // Missing enabled fields default to true for backwards compatibility with older admin files.
-    TIKTOK_USERNAME_ENABLED = cfgBool(cfg.usernameEnabled ?? cfg.primaryEnabled ?? cfg.enabled, Boolean(TIKTOK_USERNAME));
-
-    const rawExtraUsers = Array.isArray(cfg.extraUsernames)
-      ? cfg.extraUsernames
-      : [cfg.username2 ?? cfg.secondaryUsername ?? cfg.extraUsername].filter(Boolean);
-    const nextExtraUsers = uniqueTikTokUsers(rawExtraUsers);
-    if (nextExtraUsers.length || 'username2' in cfg || 'secondaryUsername' in cfg || 'extraUsernames' in cfg) {
-      EXTRA_TIKTOK_USERNAMES = nextExtraUsers;
-    }
-
-    TIKTOK_USERNAME_2_ENABLED = cfgBool(
-      cfg.username2Enabled ?? cfg.secondaryEnabled ?? cfg.extraUsernamesEnabled ?? cfg.extraEnabled,
-      EXTRA_TIKTOK_USERNAMES.length > 0
-    );
-
-    const afterUsersKey = JSON.stringify(getStreamUsers());
-    if (afterUsersKey !== beforeUsersKey || afterUsersKey !== _lastStreamUsersKey) {
-      info(`[sync] TikTok streams now enabled: ${getStreamUsers().length ? getStreamUsers().map(u => '@' + u).join(', ') : 'none'}`);
-      _lastStreamUsersKey = afterUsersKey;
-      rebuildTikTokConnections();
-      connectAllTikTok();
-    }
-
-    // Twitch channel settings from the admin panel. Twitch shares the same saved-name JSON,
-    // but each Twitch account is stored with a twitch_ prefix so it never collides with TikTok.
-    const beforeTwitchKey = JSON.stringify({ enabled: Boolean(TWITCH_ENABLED), channels: twitchChannelsKey(TWITCH_CHANNELS) });
-    if (cfg.twitchEnabled !== undefined || cfg.twitchChannel !== undefined || cfg.twitchChannels !== undefined) {
-      TWITCH_ENABLED = boolFromConfigOrEnv(cfg.twitchEnabled, TWITCH_ENABLED);
-      const nextTwitchChannels = Array.isArray(cfg.twitchChannels)
-        ? cfg.twitchChannels
-        : String(cfg.twitchChannel || '').split(',');
-      const parsedTwitchChannels = parseTwitchChannelList(nextTwitchChannels);
-      const configTouchedTwitchChannels = cfg.twitchChannels !== undefined || cfg.twitchChannel !== undefined;
-      if (parsedTwitchChannels.length || (configTouchedTwitchChannels && !TWITCH_ENV_FORCE_ENABLED)) {
-        TWITCH_CHANNELS = parsedTwitchChannels;
+      if (typeof cfg.username === 'string') {
+        const nextPrimary = normalizeTikTokUsername(cfg.username);
+        if (nextPrimary) TIKTOK_USERNAME = nextPrimary;
       }
-    }
-    TWITCH_CHANNELS = parseTwitchChannelList(TWITCH_CHANNELS);
-    const afterTwitchKey = JSON.stringify({ enabled: Boolean(TWITCH_ENABLED), channels: twitchChannelsKey(TWITCH_CHANNELS) });
-    if (afterTwitchKey !== beforeTwitchKey) {
-      info(`[sync] Twitch chat ${TWITCH_ENABLED ? 'enabled' : 'disabled'}: ${twitchChannelsDisplay() || 'no channels'}`);
-      restartTwitchChat();
+      TIKTOK_USERNAME_ENABLED = cfgBool(cfg.usernameEnabled ?? cfg.primaryEnabled ?? cfg.enabled, Boolean(TIKTOK_USERNAME));
+
+      const rawExtraUsers = Array.isArray(cfg.extraUsernames)
+        ? cfg.extraUsernames
+        : [cfg.username2 ?? cfg.secondaryUsername ?? cfg.extraUsername].filter(Boolean);
+      const nextExtraUsers = uniqueTikTokUsers(rawExtraUsers);
+      if (nextExtraUsers.length || 'username2' in cfg || 'secondaryUsername' in cfg || 'extraUsernames' in cfg) {
+        EXTRA_TIKTOK_USERNAMES = nextExtraUsers;
+      }
+      TIKTOK_USERNAME_2_ENABLED = cfgBool(
+        cfg.username2Enabled ?? cfg.secondaryEnabled ?? cfg.extraUsernamesEnabled ?? cfg.extraEnabled,
+        EXTRA_TIKTOK_USERNAMES.length > 0
+      );
+
+      const afterUsersKey = JSON.stringify(getStreamUsers());
+      if (afterUsersKey !== beforeUsersKey || afterUsersKey !== _lastStreamUsersKey) {
+        info(`[sync] Legacy TikTok targets: ${getStreamUsers().map(u => '@' + u).join(', ') || 'none'}`);
+        _lastStreamUsersKey = afterUsersKey;
+        rebuildTikTokConnections();
+        connectAllTikTok();
+      }
+
+      const beforeTwitchKey = JSON.stringify({ enabled: Boolean(TWITCH_ENABLED), channels: twitchChannelsKey(TWITCH_CHANNELS) });
+      if (cfg.twitchEnabled !== undefined || cfg.twitchChannel !== undefined || cfg.twitchChannels !== undefined) {
+        TWITCH_ENABLED = boolFromConfigOrEnv(cfg.twitchEnabled, TWITCH_ENABLED);
+        const nextTwitchChannels = Array.isArray(cfg.twitchChannels)
+          ? cfg.twitchChannels
+          : String(cfg.twitchChannel || '').split(',');
+        const parsedTwitchChannels = parseTwitchChannelList(nextTwitchChannels);
+        const configTouchedTwitchChannels = cfg.twitchChannels !== undefined || cfg.twitchChannel !== undefined;
+        if (parsedTwitchChannels.length || (configTouchedTwitchChannels && !TWITCH_ENV_FORCE_ENABLED)) {
+          TWITCH_CHANNELS = parsedTwitchChannels;
+        }
+      }
+      TWITCH_CHANNELS = parseTwitchChannelList(TWITCH_CHANNELS);
+      const afterTwitchKey = JSON.stringify({ enabled: Boolean(TWITCH_ENABLED), channels: twitchChannelsKey(TWITCH_CHANNELS) });
+      if (afterTwitchKey !== beforeTwitchKey) {
+        info(`[sync] Legacy Twitch channels: ${twitchChannelsDisplay() || 'none'}`);
+        restartTwitchChat();
+      }
     }
   } catch (e) {
     if (!e.message?.includes('aborted')) warn(`[sync] Config fetch error: ${e.message}`);
@@ -1091,64 +1144,29 @@ async function fetchBotStreamersFromServer() {
     const { streamers } = await r.json();
     if (!Array.isArray(streamers)) return;
 
-    tiktokUsernameToSlug.clear();
-    twitchChannelToSlug.clear();
-    serverProvidedSessions.clear();
+    const legacyTikTok = LEGACY_BOT_MODE && TIKTOK_USERNAME_ENABLED
+      ? [TIKTOK_USERNAME, ...(TIKTOK_USERNAME_2_ENABLED ? EXTRA_TIKTOK_USERNAMES : [])].filter(Boolean)
+      : [];
+    const legacyTwitch = LEGACY_BOT_MODE
+      ? parseTwitchChannelList(process.env.TWITCH_CHANNELS || process.env.TWITCH_CHANNEL || '')
+      : [];
 
-    const newTwitchChannels = [];
-    for (const s of streamers) {
-      const slug = String(s.slug || '').trim();
-      if (!slug) continue;
-      if (s.tiktokUsername) {
-        const u = normalizeTikTokUsername(s.tiktokUsername);
-        if (u) {
-          tiktokUsernameToSlug.set(u, slug);
-          if (s.tiktokSessionId) serverProvidedSessions.set(u, s.tiktokSessionId);
-        }
-      }
-      if (s.twitchChannel) {
-        const ch = String(s.twitchChannel).toLowerCase().replace(/^#+/, '');
-        if (ch) {
-          twitchChannelToSlug.set(ch, slug);
-          newTwitchChannels.push(ch);
-        }
-      }
-      // Co-stream relays (SiegeQueue dashboard): guest TikTok / Twitch → same slug + queue
-      const relays = Array.isArray(s.relayConnections) ? s.relayConnections : [];
-      for (const rel of relays) {
-        if (!rel || typeof rel !== 'object') continue;
-        if (rel.tiktokEnabled !== false && rel.tiktokUsername) {
-          const u = normalizeTikTokUsername(rel.tiktokUsername);
-          if (u) {
-            tiktokUsernameToSlug.set(u, slug);
-            if (rel.tiktokSessionId) serverProvidedSessions.set(u, rel.tiktokSessionId);
-          }
-        }
-        if (rel.twitchEnabled !== false && rel.twitchChannel) {
-          const ch = String(rel.twitchChannel).toLowerCase().replace(/^#+/, '');
-          if (ch) {
-            twitchChannelToSlug.set(ch, slug);
-            newTwitchChannels.push(ch);
-          }
-        }
-      }
-    }
+    const counts = streamerRegistry.applyApiStreamers(streamers, {
+      legacyTikTok,
+      legacyTwitch,
+      allowTwitchWithoutFeatureFlag: LEGACY_BOT_MODE,
+    });
 
-    info(`[sync] Loaded ${tiktokUsernameToSlug.size} TikTok / ${twitchChannelToSlug.size} Twitch streamer configs from server (includes co-stream relays)`);
+    info(`[sync] Platform registry: ${counts.tiktokCount} TikTok, ${counts.twitchCount} Twitch (${counts.targetCount} targets)`);
 
-    // Rebuild TikTok connections so new sessions and usernames are picked up.
     rebuildTikTokConnections();
     connectAllTikTok();
 
-    // Merge server-provided Twitch channels with any from env vars, restart if changed.
-    const envChannels = parseTwitchChannelList(process.env.TWITCH_CHANNELS || process.env.TWITCH_CHANNEL || '');
-    const merged = parseTwitchChannelList([...new Set([...envChannels, ...newTwitchChannels])].join(','));
     const beforeKey = JSON.stringify(twitchChannelsKey(TWITCH_CHANNELS));
-    TWITCH_CHANNELS = merged;
-    if (merged.length > 0) TWITCH_ENABLED = true;
+    const twitchChanged = syncTwitchChannelsFromRegistry();
     const afterKey = JSON.stringify(twitchChannelsKey(TWITCH_CHANNELS));
-    if (afterKey !== beforeKey) {
-      info(`[sync] Twitch channels updated: ${twitchChannelsDisplay() || 'none'}`);
+    if (twitchChanged || afterKey !== beforeKey) {
+      info(`[sync] Twitch worker channels: ${twitchChannelsDisplay() || 'none'}`);
       restartTwitchChat();
     }
   } catch (e) {
@@ -1205,38 +1223,50 @@ function getSavedUsersForAdmin() {
 
 // Fire-and-forget: send every raw TikTok message to the server ring buffer.
 // Non-critical — never throws, never awaited by the caller.
-function mirrorChatMessage({ platform = 'tiktok', stream, tiktokId, twitchUsername, username, nickname, msg, event }) {
+function mirrorChatMessage({ platform = 'tiktok', stream, streamSlug = null, tiktokId, twitchUsername, username, nickname, msg, event }) {
   if (!ADMIN_PASSWORD) return;
   const cleanPlatform = String(platform || 'tiktok').toLowerCase() === 'twitch' ? 'twitch' : 'tiktok';
   const account = username || twitchUsername || tiktokId || '';
-  fetchWithTimeout(`${BASE_URL}/api/bot/chat`, {
+  const slug = String(streamSlug || '').trim();
+  const parsed = parseBotCommandMessage(msg);
+  // Per-streamer queues: worker mutates via /api/s/:slug/admin/*; chat mirror is display-only.
+  const isCommand = slug ? false : Boolean(parsed);
+
+  const payload = {
+    platform: cleanPlatform,
+    stream,
+    username: account,
+    tiktokId: cleanPlatform === 'tiktok' ? account : '',
+    tiktokUsername: cleanPlatform === 'tiktok' ? account : '',
+    twitchUsername: cleanPlatform === 'twitch' ? account : '',
+    nickname,
+    msg,
+    event,
+    isCommand,
+    ts: Date.now(),
+  };
+
+  const chatUrl = slug
+    ? `${BASE_URL}/api/s/${encodeURIComponent(slug)}/chat`
+    : `${BASE_URL}/api/bot/chat`;
+
+  fetchWithTimeout(chatUrl, {
     method : 'POST',
     headers: authHeaders(),
-    body   : JSON.stringify({
-      platform: cleanPlatform,
-      stream,
-      username: account,
-      tiktokId: cleanPlatform === 'tiktok' ? account : '',
-      tiktokUsername: cleanPlatform === 'tiktok' ? account : '',
-      twitchUsername: cleanPlatform === 'twitch' ? account : '',
-      nickname,
-      msg,
-      event,
-      ts: Date.now()
-    }),
+    body   : JSON.stringify(payload),
   }, 4_000).then(async (res) => {
     if (res.ok) return;
     const detail = await responseFailureDetail(res);
-    warnPostFailure('chat-mirror', `Live chat mirror failed at /api/bot/chat: ${detail}`);
-    postAdminLog('warn', 'chat-mirror', `Live chat mirror failed at /api/bot/chat: ${detail}`, {
-      endpoint: '/api/bot/chat',
+    warnPostFailure('chat-mirror', `Live chat mirror failed at ${chatUrl}: ${detail}`);
+    postAdminLog('warn', 'chat-mirror', `Live chat mirror failed at ${chatUrl}: ${detail}`, {
+      endpoint: chatUrl,
       status: res.status,
       platform: cleanPlatform,
       stream,
     }).catch(() => {});
   }).catch((e) => {
     const message = e?.message || String(e || 'unknown error');
-    warnPostFailure('chat-mirror', `Live chat mirror could not reach ${BASE_URL}/api/bot/chat: ${message}`);
+    warnPostFailure('chat-mirror', `Live chat mirror could not reach ${chatUrl}: ${message}`);
   });
 }
 
@@ -1293,17 +1323,28 @@ async function postBotStatusToServer(extra = {}) {
         tiktokSavedUsers: savedUsers,
         streams      : [...streams.values()].map(s => ({
           username: s.username,
+          slug: s.slug || streamerRegistry.getSlugForTikTok(s.username) || null,
+          status: s.status || (s.connected ? 'online' : (s.connecting ? 'reconnecting' : 'offline')),
           connected: Boolean(s.connected),
           connecting: Boolean(s.connecting),
           viewers: Number(s.currentViewers || 0),
           roomId: s.currentRoomId || null,
+          nextRetryMs: tiktokReconnect.msUntilRetry(tiktokKey(s.username)),
+          lastError: s.lastError || null,
+        })),
+        streamerTargets: streamerRegistry.listTargets().map(t => ({
+          key: t.key,
+          platform: t.platform,
+          slug: t.slug,
+          username: t.username || '',
+          channel: t.channel || '',
+          status: t.status,
+          isLive: !!t.isLive,
         })),
         usernames: {
-          username: TIKTOK_USERNAME,
-          usernameEnabled: TIKTOK_USERNAME_ENABLED,
-          username2: EXTRA_TIKTOK_USERNAMES[0] || '',
-          username2Enabled: TIKTOK_USERNAME_2_ENABLED,
-          extraUsernames: EXTRA_TIKTOK_USERNAMES,
+          mode: LEGACY_BOT_MODE ? 'legacy+platform' : 'platform',
+          armedTikTok: streamerRegistry.getTikTokUsernames(),
+          armedTwitch: streamerRegistry.getTwitchChannels(),
         },
       }),
     }, 5_000);
@@ -1343,6 +1384,66 @@ function getPosition(name) {
   const n = String(name || '').toLowerCase();
   const idx = liveQueue.findIndex(p => p.name.toLowerCase() === n);
   return idx === -1 ? null : idx + 1;
+}
+
+const streamerQueueCache = new Map();
+
+async function refreshStreamerQueueState(slug) {
+  const key = String(slug || '').trim();
+  if (!key) return null;
+  try {
+    const r = await fetchWithTimeout(`${BASE_URL}/api/s/${encodeURIComponent(key)}/state`, {}, 6_000);
+    if (!r.ok) return null;
+    const state = await r.json();
+    const rawQueue = Array.isArray(state.queue) ? state.queue : [];
+    const rawPlaying = Array.isArray(state.playing) ? state.playing : [];
+    const cached = {
+      queue: rawQueue.map((p, i) => ({ name: playerName(p), position: i + 1 })).filter(p => p.name),
+      playing: rawPlaying.map(p => ({ name: playerName(p) })).filter(p => p.name),
+      updatedAt: Date.now(),
+    };
+    streamerQueueCache.set(key, cached);
+    return cached;
+  } catch {
+    return null;
+  }
+}
+
+async function refreshQueueContext(streamSlug = null) {
+  if (streamSlug) return refreshStreamerQueueState(streamSlug);
+  return refreshLiveQueueFromServer();
+}
+
+function isInQueueForSlug(name, streamSlug = null) {
+  const n = String(name || '').toLowerCase();
+  if (!n) return false;
+  if (streamSlug) {
+    const cached = streamerQueueCache.get(streamSlug);
+    return Boolean(cached && cached.queue.some(p => p.name.toLowerCase() === n));
+  }
+  return isInQueue(name);
+}
+
+function isPlayingForSlug(name, streamSlug = null) {
+  const n = String(name || '').toLowerCase();
+  if (!n) return false;
+  if (streamSlug) {
+    const cached = streamerQueueCache.get(streamSlug);
+    return Boolean(cached && cached.playing.some(p => p.name.toLowerCase() === n));
+  }
+  return isPlaying(name);
+}
+
+function getPositionForSlug(name, streamSlug = null) {
+  const n = String(name || '').toLowerCase();
+  if (!n) return null;
+  if (streamSlug) {
+    const cached = streamerQueueCache.get(streamSlug);
+    if (!cached) return null;
+    const idx = cached.queue.findIndex(p => p.name.toLowerCase() === n);
+    return idx === -1 ? null : idx + 1;
+  }
+  return getPosition(name);
 }
 
 function findKnownNameForInput(name, tiktokId) {
@@ -1621,9 +1722,10 @@ function ensureStream(username) {
 
   const entry = {
     username,
-    slug: tiktokUsernameToSlug.get(username) || null,
+    registryKey: tiktokKey(username),
+    slug: streamerRegistry.getSlugForTikTok(username) || null,
+    status: 'offline',
     conn: null,
-    retryDelay: 10_000,
     reconnectTimer: null,
     connectTimeout: null,
     connecting: false,
@@ -1633,6 +1735,7 @@ function ensureStream(username) {
     lastConnectAttempt: 0,
     lastAnyEventAt: 0,
     lastChatAt: 0,
+    lastError: null,
   };
   streams.set(username, entry);
   createFreshTikTokConnection(entry);
@@ -1673,18 +1776,21 @@ function rebuildTikTokConnections() {
   const wanted = new Set(getStreamUsers());
 
   for (const [username, entry] of streams) {
-    // Refresh slug on each rebuild so dashboard changes propagate without restart.
-    entry.slug = tiktokUsernameToSlug.get(username) || entry.slug || null;
+    entry.slug = streamerRegistry.getSlugForTikTok(username) || entry.slug || null;
+    entry.registryKey = tiktokKey(username);
     if (!wanted.has(username)) {
-      warn(`[sync] Removing TikTok connection @${username}`);
+      info(`[sync] Removing armed TikTok target @${username}`);
+      tiktokReconnect.reset(entry.registryKey);
       disconnectStream(username);
+      streamerRegistry.setTargetStatus(entry.registryKey, 'disabled');
     }
   }
 
   for (const username of wanted) {
     if (!streams.has(username)) {
-      info(`[sync] Adding TikTok connection @${username}`);
+      info(`[sync] Arming TikTok target @${username}${streamerRegistry.getSlugForTikTok(username) ? ` → ${streamerRegistry.getSlugForTikTok(username)}` : ''}`);
       ensureStream(username);
+      streamerRegistry.setTargetStatus(tiktokKey(username), 'offline');
     }
   }
 
@@ -1696,8 +1802,17 @@ function scheduleReconnect(username, delayMs) {
   if (!getStreamUsers().includes(username)) return;
   const entry = ensureStream(username);
   if (!entry) return;
-  const safeDelay = Math.min(MAX_RETRY_MS, Math.max(3_000, Number(delayMs || 10_000)));
+
+  const key = entry.registryKey || tiktokKey(username);
+  const safeDelay = Math.min(
+    MAX_RETRY_MS,
+    Math.max(MIN_RETRY_MS, Number(delayMs || tiktokReconnect.snapshot(key)?.delayMs || MIN_RETRY_MS))
+  );
+
   if (entry.reconnectTimer) clearTimeout(entry.reconnectTimer);
+  entry.status = delayMs && delayMs >= MIN_RETRY_MS * 2 ? 'rate_limited' : 'reconnecting';
+  streamerRegistry.setTargetStatus(key, entry.status, { error: entry.lastError || null });
+
   entry.reconnectTimer = setTimeout(() => {
     entry.reconnectTimer = null;
     connectTikTok(username);
@@ -1709,39 +1824,41 @@ function connectTikTok(username) {
   if (!getStreamUsers().includes(username)) return;
   const entry = ensureStream(username);
   if (!entry || entry.connecting || entry.connected) return;
+
+  const key = entry.registryKey || tiktokKey(username);
+  if (!tiktokReconnect.canAttempt(key)) return;
   if (!hasTikTokConnector()) {
     warnMissingTikTokConnector(`connecting @${username}`);
     return;
   }
 
   entry.connecting = true;
+  entry.status = 'reconnecting';
   entry.lastConnectAttempt = Date.now();
+  streamerRegistry.setTargetStatus(key, 'reconnecting');
   const currentConn = createFreshTikTokConnection(entry);
   if (!currentConn) return;
 
-  // If TikTok never answers while the live is offline/starting, do not stay stuck
-  // in "connecting" forever. Reset this stream and keep scanning for the live.
   if (entry.connectTimeout) clearTimeout(entry.connectTimeout);
   entry.connectTimeout = setTimeout(() => {
-    // If another reconnect already replaced this connection, this timeout belongs
-    // to an old attempt. Do not let it disconnect the newer connection.
     if (entry.conn !== currentConn) return;
     if (!entry.connected) {
-      warn(`TikTok connect timed out for @${entry.username}. Keeping it armed and trying again.`);
-      postAdminLog('warn', 'tiktok', `TikTok connect timed out for @${entry.username}. Retrying.`);
+      entry.lastError = 'connect timeout';
+      logConnectThrottled(entry.username, 'warn', `@${entry.username} connect timed out — armed, backoff retry`);
       entry.connecting = false;
       entry.connected = false;
+      entry.status = 'offline';
       entry.conn = null;
       try { if (currentConn) currentConn.disconnect(); } catch (_) {}
       updateAggregateBotState();
-      postBotStatusToServer({ connected: botConnected, connecting: false, error: `@${entry.username}: connect timeout` });
-      scheduleReconnect(entry.username, 5_000);
+      streamerRegistry.setTargetStatus(key, 'offline', { error: entry.lastError });
+      const delay = tiktokReconnect.scheduleFailure(key, { message: entry.lastError });
+      scheduleReconnect(entry.username, delay);
     }
   }, CONNECT_TIMEOUT_MS);
 
   const hasSession = !!getSessionIdForUsername(entry.username);
-  info(`Connecting to @${entry.username}… ${hasSession ? '(sessionid set)' : '(no sessionid)'}`);
-  postAdminLog('info', 'tiktok', `Connecting to @${entry.username}${hasSession ? ' with sessionid' : ' without sessionid'}`);
+  logConnectThrottled(entry.username, 'info', `Connecting @${entry.username}${entry.slug ? ` (${entry.slug})` : ''}${hasSession ? ' [session]' : ''}`);
   updateAggregateBotState();
   postBotStatusToServer({ connecting: true, connected: botConnected });
 
@@ -1751,14 +1868,16 @@ function connectTikTok(username) {
       if (entry.connectTimeout) clearTimeout(entry.connectTimeout);
       entry.connectTimeout = null;
       entry.connecting = false;
-      entry.retryDelay = 10_000;
       entry.connected = true;
+      entry.status = 'online';
+      entry.lastError = null;
       entry.currentRoomId = state?.roomId ? String(state.roomId) : null;
       entry.lastAnyEventAt = Date.now();
       entry.lastChatAt = 0;
-      ok(`Connected to TikTok Live @${entry.username}`);
-      postAdminLog('success', 'tiktok', `Connected to TikTok Live @${entry.username}`, { roomId: entry.currentRoomId });
-      if (state?.roomId) info(`@${entry.username} Room ID: ${state.roomId}`);
+      tiktokReconnect.markSuccess(key);
+      streamerRegistry.setTargetStatus(key, 'online', { connected: true, connecting: false });
+      ok(`@${entry.username} online${entry.slug ? ` (${entry.slug})` : ''}`);
+      postAdminLog('success', 'tiktok', `@${entry.username} TikTok live connected`, { roomId: entry.currentRoomId, slug: entry.slug });
       updateAggregateBotState();
       postBotStatusToServer({ connected: botConnected, connecting: false, roomId: currentRoomId });
     })
@@ -1770,20 +1889,30 @@ function connectTikTok(username) {
       entry.connected = false;
       entry.currentRoomId = null;
       const hint = e?.exception?.retryAfter ?? e?.retryAfter;
-      // TikTok sometimes returns retryAfter: 120 after a short hiccup.
-      // That made the bot go silent for about 2 minutes. Cap every retry.
-      const hintedDelay = hint ? Number(hint) * 1_000 : entry.retryDelay;
-      const delay = Math.min(MAX_RETRY_MS, Math.max(3_000, Number(hintedDelay || entry.retryDelay || 10_000)));
-      entry.retryDelay = Math.min(Math.max(10_000, entry.retryDelay * 2), MAX_RETRY_MS);
+      const hintedDelay = hint ? Number(hint) * 1_000 : 0;
       updateAggregateBotState();
 
       const message = safeTikTokErrorMessage(e);
-      err(`TikTok connect failed for @${entry.username}: ${message}`);
-      postAdminLog('error', 'tiktok', `TikTok connect failed for @${entry.username}: ${message}`);
-      if (!getSessionIdForUsername(entry.username)) warn(`Tip: set a sessionid for @${entry.username}. Use TIKTOK_SESSION_ID for primary, TIKTOK_SESSION_ID_2 for the second stream, or TIKTOK_SESSION_IDS=username=sessionid.`);
-      info(`Keeping @${entry.username} armed. Retrying in ${Math.round(delay / 1000)}s so you do NOT have to redeploy when that live starts.`);
-      postAdminLog('info', 'tiktok', `Keeping @${entry.username} armed. Retrying in ${Math.round(delay / 1000)}s`);
-      postBotStatusToServer({ connected: botConnected, connecting: false, error: `@${entry.username}: ${message}` });
+      const failureKind = classifyTikTokConnectFailure(message);
+      entry.lastError = message;
+      entry.status = failureKind.invalid ? 'invalid_user' : (failureKind.rateLimited ? 'rate_limited' : 'offline');
+      streamerRegistry.setTargetStatus(key, entry.status, { error: message, connected: false, connecting: false });
+
+      const delay = tiktokReconnect.scheduleFailure(key, {
+        hintedMs: hintedDelay,
+        rateLimited: failureKind.rateLimited,
+        invalid: failureKind.invalid,
+        message,
+      });
+
+      logConnectThrottled(
+        entry.username,
+        failureKind.invalid ? 'warn' : 'info',
+        `@${entry.username} offline (${entry.status}) — retry in ${Math.round(delay / 1000)}s`
+      );
+      if (failureKind.invalid) {
+        postAdminLog('warn', 'tiktok', `@${entry.username} invalid/offline user — armed with long backoff`, { slug: entry.slug });
+      }
       scheduleReconnect(entry.username, delay);
     });
 }
@@ -1796,16 +1925,13 @@ function connectAllTikTok() {
     return;
   }
   if (!activeUsers.length) {
-    warn('No TikTok accounts are enabled. Turn one on in the admin panel to start watching chat.');
-    postBotStatusToServer({ connected: false, connecting: false, error: 'No TikTok accounts enabled' });
+    info('No TikTok targets armed — waiting for streamers on the platform.');
+    postBotStatusToServer({ connected: false, connecting: false, error: null });
     return;
   }
 
-  // Stagger connection attempts slightly. This avoids TikTok rate-limit/weirdness
-  // where trying both rooms at the exact same millisecond can make one say it
-  // cannot reach the room even though the other works.
   activeUsers.forEach((username, i) => {
-    setTimeout(() => connectTikTok(username), i * 5_000);
+    setTimeout(() => connectTikTok(username), i * 2_000);
   });
 }
 
@@ -1838,8 +1964,8 @@ function keepTikTokConnectionsAlive() {
       continue;
     }
 
-    if (!entry.connected && !entry.connecting && !entry.reconnectTimer) {
-      info(`Live scanner: @${entry.username} is not connected — checking again now.`);
+    const key = entry.registryKey || tiktokKey(entry.username);
+    if (!entry.connected && !entry.connecting && !entry.reconnectTimer && tiktokReconnect.canAttempt(key)) {
       connectTikTok(entry.username);
     }
   }
@@ -1955,17 +2081,21 @@ async function handleChatCommand(data, eventName = 'chat', overrides = {}, entry
 
     // Resolve the streamer slug for per-streamer queue routing.
     let streamSlug = null;
-    if (platform === 'tiktok' && entry && entry.slug) {
-      streamSlug = entry.slug;
+    if (platform === 'tiktok' && entry) {
+      streamSlug = entry.slug || streamerRegistry.getSlugForTikTok(entry.username) || null;
     } else if (platform === 'twitch') {
-      const ch = String(overrides.sourceUsername || '').replace(/^twitch:#/, '');
-      streamSlug = twitchChannelToSlug.get(ch) || null;
+      const ch = String(overrides.sourceUsername || '').replace(/^twitch:#/, '').toLowerCase();
+      streamSlug = streamerRegistry.getSlugForTwitch(ch) || null;
     }
     const sourceLabel = String(overrides.sourceUsername || (entry ? entry.username : '') || platform).trim();
     const display  = overrides.displayName || data?.nickname || data?.user?.nickname || data?.uniqueId || data?.user?.uniqueId || 'unknown';
     const rawTikTokId = overrides.rawUserId || safeTikTokIdentity(data, display, sourceLabel);
     const tiktokId = rawTikTokId;
-    const userKey = overrides.userKey || (platform === 'twitch' ? platformUserKey('twitch', rawTikTokId) : streamUserKey(sourceLabel, rawTikTokId));
+    const userKey = overrides.userKey || (
+      platform === 'twitch'
+        ? (streamSlug ? `${streamSlug}::${platformUserKey('twitch', rawTikTokId)}` : platformUserKey('twitch', rawTikTokId))
+        : streamUserKey(sourceLabel, rawTikTokId, streamSlug)
+    );
     const msg      = String(data?.comment || data?.text || data?.content || data?.msg || '').trim();
     const lower    = msg.toLowerCase();
     if (platform === 'tiktok' && entry) {
@@ -1982,12 +2112,13 @@ async function handleChatCommand(data, eventName = 'chat', overrides = {}, entry
     mirrorChatMessage({
       platform,
       stream: sourceLabel,
+      streamSlug,
       tiktokId: platform === 'tiktok' ? rawTikTokId : '',
       twitchUsername: platform === 'twitch' ? rawTikTokId : '',
       username: rawTikTokId,
       nickname: display,
       msg,
-      event: eventName
+      event: eventName,
     });
 
     const bareJoinName = '';
@@ -2019,8 +2150,9 @@ async function handleChatCommand(data, eventName = 'chat', overrides = {}, entry
       return;
     }
 
-    // Only rate-limit queue/temp JOIN and RESET commands (leave is always allowed).
-    const cooldownKey = `${userKey}:join`;
+    // Per-streamer command cooldown (isolated queue contexts).
+    const cooldownScope = streamSlug || 'global';
+    const cooldownKey = `${cooldownScope}:${userKey}:join`;
     if ((isJoinCmd || isTempCmd) && isOnCooldown(cooldownKey)) {
       const left = Math.ceil(cooldownRemainingMs(cooldownKey) / 1000);
       cmd(`[${sourceLabel}] [cooldown] @${display} / key=${userKey} — ignored join (${left}s left, per-user cooldown)`);
@@ -2067,10 +2199,10 @@ async function handleChatCommand(data, eventName = 'chat', overrides = {}, entry
         return;
       }
 
-      await refreshLiveQueueFromServer();
-      if (isInQueue(oldName) || isPlaying(oldName)) {
+      await refreshQueueContext(streamSlug);
+      if (isInQueueForSlug(oldName, streamSlug) || isPlayingForSlug(oldName, streamSlug)) {
         await removeFromQueue(oldName, streamSlug);
-        await refreshLiveQueueFromServer();
+        await refreshQueueContext(streamSlug);
       }
 
       const oldCanonical = canonicalName(oldName);
@@ -2105,10 +2237,10 @@ async function handleChatCommand(data, eventName = 'chat', overrides = {}, entry
 
     // ── leave — leave queue ─────────────────────────────────────────────────────
     if (isLeaveCmd) {
-      await refreshLiveQueueFromServer();
+      await refreshQueueContext(streamSlug);
       const record = getRecord(users, userKey);
       const nameToRemove = record.name;
-      if (!nameToRemove || (!isInQueue(nameToRemove) && !isPlaying(nameToRemove))) {
+      if (!nameToRemove || (!isInQueueForSlug(nameToRemove, streamSlug) && !isPlayingForSlug(nameToRemove, streamSlug))) {
         respond(tiktokId, 'You are not currently in the queue.', sourceLabel);
         cmd(`[${sourceLabel}] [leave] @${display} not in queue`);
         postAdminLog('warn', 'queue', `@${display} used leave but is not in queue`, { stream: sourceLabel, tiktokId });
@@ -2118,7 +2250,7 @@ async function handleChatCommand(data, eventName = 'chat', overrides = {}, entry
       if (leaveResult === 'removed') {
         users[userKey] = { name: nameToRemove, queued: false };
         saveUsers(users);
-        await refreshLiveQueueFromServer();
+        await refreshQueueContext(streamSlug);
         respond(tiktokId, `${nameToRemove} has been removed from the queue.`, sourceLabel);
         ok(`[${sourceLabel}] [leave] @${display} left queue: ${nameToRemove}`);
         postAdminLog('success', 'queue', `${nameToRemove} left queue from @${display}`, { stream: sourceLabel, tiktokId, name: nameToRemove });
@@ -2163,7 +2295,7 @@ async function handleChatCommand(data, eventName = 'chat', overrides = {}, entry
     let record         = getRecord(users, userKey);
     const joinNameFromCommand = afterCommand || record.name || '';
 
-    await refreshLiveQueueFromServer();
+    await refreshQueueContext(streamSlug);
 
     // If older bot versions saved somebody under their TikTok display name
     // instead of their stable @uniqueId, move that record to the stable key.
@@ -2181,11 +2313,11 @@ async function handleChatCommand(data, eventName = 'chat', overrides = {}, entry
     }
 
     if (!isTempCmd && ownNameIsActive(record)) {
-      const pos = getPosition(record.name);
+      const pos = getPositionForSlug(record.name, streamSlug);
       // Determine if the person tried a DIFFERENT name or their same/saved name
       const triedName = isBareJoin ? bareJoinName : joinNameFromCommand;
       const isSameName = !triedName || canonicalName(triedName) === canonicalName(record.name);
-      if (isPlaying(record.name)) {
+      if (isPlayingForSlug(record.name, streamSlug)) {
         respond(tiktokId, `${record.name} is currently playing.`, sourceLabel);
       } else if (isSameName) {
         // They re-typed their own name (or queue with no name) - clear "already in queue" message
@@ -2258,7 +2390,7 @@ async function handleChatCommand(data, eventName = 'chat', overrides = {}, entry
       }
       const result = await addToQueue(clean, streamSlug);
       if (result === 'added' || result === 'already') {
-        await refreshLiveQueueFromServer();
+        await refreshQueueContext(streamSlug);
         let serverSaved = false;
         if (!isTempCmd) {
           setRecord(users, userKey, { name: clean, queued: true });
@@ -2268,7 +2400,7 @@ async function handleChatCommand(data, eventName = 'chat', overrides = {}, entry
           cmd(`[${sourceLabel}] [temp] @${display} added without saving chat account: ${clean}`);
           postBotStatusToServer().catch(() => {});
         }
-        const pos = getPosition(clean) || '?';
+        const pos = getPositionForSlug(clean, streamSlug) || '?';
         respond(tiktokId, result === 'added' ? `${clean} added to queue! Position: #${pos}` : `${clean} is already in queue at #${pos}.`, sourceLabel);
         ok(`[${sourceLabel}] [${isTempCmd ? 'temp' : 'queue'}] @${display} → ${clean} ${result} (#${pos})`);
         postAdminLog('success', 'queue', `${clean} ${result === 'added' ? 'added to queue' : 'already in queue'} from @${display}${isTempCmd ? ' (temp, not saved)' : ''}`, { stream: sourceLabel, tiktokId, userKey, name: clean, position: pos, result, serverSaved, temporary: isTempCmd });
@@ -2307,20 +2439,22 @@ function registerTikTokEvents(entry) {
   tiktok.on('share',  () => { if (entry.conn === tiktok) markTikTokEvent(entry); });
 
   tiktok.on('disconnected', () => {
-    if (entry.conn !== tiktok) return; // ignore late disconnects from stale TikTok connection objects
+    if (entry.conn !== tiktok) return;
     if (entry.connectTimeout) clearTimeout(entry.connectTimeout);
     entry.connectTimeout = null;
     entry.connected = false;
     entry.connecting = false;
+    entry.status = 'offline';
     entry.currentRoomId = null;
     entry.conn = null;
     entry.lastAnyEventAt = 0;
+    entry.lastError = 'disconnected';
+    const key = entry.registryKey || tiktokKey(sourceUsername);
     updateAggregateBotState();
-    warn(`TikTok disconnected @${sourceUsername} — reconnecting in 3 seconds. No redeploy needed.`);
-    postAdminLog('warn', 'tiktok', `TikTok disconnected @${sourceUsername}. Reconnecting in 8 seconds.`);
-    entry.retryDelay = 10_000;
-    postBotStatusToServer({ connected: botConnected, connecting: false, error: `@${sourceUsername} disconnected` });
-    scheduleReconnect(sourceUsername, 8_000);
+    streamerRegistry.setTargetStatus(key, 'offline', { error: entry.lastError });
+    const delay = tiktokReconnect.scheduleFailure(key, { message: 'disconnected' });
+    logConnectThrottled(sourceUsername, 'info', `@${sourceUsername} disconnected — retry in ${Math.round(delay / 1000)}s`);
+    scheduleReconnect(sourceUsername, delay);
   });
 
   tiktok.on('error', e => {
@@ -2518,7 +2652,8 @@ setInterval(() => {
   const knownRecords  = Object.keys(users).length;
   const savedNames    = getSavedUsersForAdmin().length;
   const queued        = getSavedUsersForAdmin().filter(r => r?.queued || r?.active || r?.inQueue || r?.playing).length;
-  info(`Stats — enabled streams: ${getStreamUsers().map(u => '@' + u).join(', ') || 'none'}, saved names: ${savedNames}, known records: ${knownRecords}, queued records: ${queued}, live queue: ${liveQueue.length}, playing: ${livePlaying.length}, viewers: ${currentViewers}, twitch: ${twitchConnected ? 'connected' : 'off/disconnected'}`);
+  const online = [...streams.values()].filter(s => s.connected).map(s => `@${s.username}`).join(', ') || 'none';
+  info(`Stats — armed: ${getStreamUsers().length} TikTok, online: ${online}, saved: ${savedNames}, global queue: ${liveQueue.length}, viewers: ${currentViewers}, twitch: ${twitchConnected ? 'on' : 'off'}`);
 }, 5 * 60_000);
 
 // ── Start ───────────────────────────────────────────────────────────────────
@@ -2534,7 +2669,15 @@ fetchBotConfigFromServer()
     startTwitchChat();
   })
   .catch(() => {
-    warn('[sync] Could not fetch server config (server may be down) — using env defaults');
+    warn('[sync] Could not fetch platform config — worker armed with empty registry until sync succeeds');
+    if (LEGACY_BOT_MODE) {
+      streamerRegistry.applyApiStreamers([], {
+        legacyTikTok: getStreamUsers(),
+        legacyTwitch: parseTwitchChannelList(process.env.TWITCH_CHANNELS || process.env.TWITCH_CHANNEL || ''),
+        allowTwitchWithoutFeatureFlag: true,
+      });
+      syncTwitchChannelsFromRegistry();
+    }
     connectAllTikTok();
     startTwitchChat();
   });
